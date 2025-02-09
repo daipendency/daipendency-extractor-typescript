@@ -1,4 +1,6 @@
-use crate::metadata;
+use std::path::{Path, PathBuf};
+
+use crate::{dependencies, metadata};
 use daipendency_extractor::{
     DependencyResolutionError, ExtractionError, Extractor, LibraryMetadata, LibraryMetadataError,
     Namespace,
@@ -19,19 +21,19 @@ impl Extractor for TypeScriptExtractor {
         metadata::extract_metadata(path)
     }
 
-    fn resolve_dependency_path(
-        &self,
-        name: &str,
-        dependant_path: &std::path::Path,
-    ) -> Result<std::path::PathBuf, DependencyResolutionError> {
-        todo!()
-    }
-
     fn extract_public_api(
         &self,
         library_metadata: &LibraryMetadata,
         parser: &mut Parser,
     ) -> Result<Vec<Namespace>, ExtractionError> {
         todo!()
+    }
+
+    fn resolve_dependency_path(
+        &self,
+        name: &str,
+        dependant_path: &Path,
+    ) -> Result<PathBuf, DependencyResolutionError> {
+        dependencies::resolve_dependency_path(name, dependant_path)
     }
 }

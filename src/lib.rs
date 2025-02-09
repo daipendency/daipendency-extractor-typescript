@@ -1,3 +1,4 @@
+mod dependencies;
 mod extractor;
 mod metadata;
 
