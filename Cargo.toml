@@ -1,0 +1,12 @@
+[package]
+name = "daipendency-extractor-typescript"
+version = "1.0.0"
+edition = "2021"
+description = "Daipendency extractor for TypeScript libraries"
+repository = "https://github.com/daipendency/daipendency-extractor-typescript"
+homepage = "https://github.com/daipendency/daipendency-extractor-typescript"
+documentation = "https://docs.rs/daipendency-extractor-typescript"
+license = "MIT"
+authors = ["Gus Narea"]
+
+[dependencies]
