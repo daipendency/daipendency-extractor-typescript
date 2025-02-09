@@ -1,0 +1,7 @@
+---
+description: Debugging tree-sitter nodes
+globs: *.rs
+---
+
+When processing a new kind of tree-sitter node or troubleshooting its processing, temporarily print the output of `daipendency_testing::debug_node(...)` from the `daipendency-testing` crate to learn the structure of such a node.
+

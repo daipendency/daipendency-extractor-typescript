@@ -65,11 +65,12 @@ dependencies = [
 
 [[package]]
 name = "daipendency-testing"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e80a93cda5b824f4396736661020dece75e1965f5835c96461deed8c61c71577"
+checksum = "0ecd58ee8682065fdc4bc2d3476a7bb485df53ac51d83ba00dc9dbd8b79d54b8"
 dependencies = [
  "tempfile",
+ "tree-sitter",
 ]
 
 [[package]]
