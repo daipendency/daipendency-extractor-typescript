@@ -28,7 +28,32 @@ pub fn parse_typescript_file(
         ));
     }
 
-    let module_jsdoc = get_module_jsdoc(node, content);
+    let jsdoc = get_module_jsdoc(node, content);
+    let (symbols, default_export_name) = get_file_symbols(node, content);
+
+    Ok(Module {
+        jsdoc,
+        symbols,
+        default_export_name,
+    })
+}
+
+fn get_jsdoc(node: Option<Node>, content: &str) -> Option<String> {
+    node.filter(|n| n.kind() == "comment")
+        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+        .filter(|comment| comment.starts_with("/**"))
+        .map(|comment| comment.to_string())
+}
+
+fn get_module_jsdoc<'a>(node: Node<'a>, content: &'a str) -> Option<String> {
+    get_jsdoc(node.child(0), content).filter(|comment_text| {
+        comment_text.contains("@file")
+            || comment_text.contains("@fileoverview")
+            || comment_text.contains("@module")
+    })
+}
+
+fn get_file_symbols(node: Node, content: &str) -> (Vec<TypeScriptSymbol>, Option<String>) {
     let mut module_symbols = vec![];
     let mut module_exported_names = vec![];
     let mut default_export_name = None;
@@ -87,31 +112,7 @@ pub fn parse_typescript_file(
         }
     }
 
-    Ok(Module {
-        jsdoc: module_jsdoc,
-        symbols: module_symbols,
-        default_export_name,
-    })
-}
-
-fn get_jsdoc(node: Option<Node>, content: &str) -> Option<String> {
-    node.filter(|n| n.kind() == "comment")
-        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-        .filter(|comment| comment.starts_with("/**"))
-        .map(|comment| comment.to_string())
-}
-
-fn get_module_jsdoc<'a>(node: Node<'a>, content: &'a str) -> Option<String> {
-    get_jsdoc(node.child(0), content).and_then(|comment_text| {
-        if comment_text.contains("@file")
-            || comment_text.contains("@fileoverview")
-            || comment_text.contains("@module")
-        {
-            Some(comment_text.to_string())
-        } else {
-            None
-        }
-    })
+    (module_symbols, default_export_name)
 }
 
 fn extract_symbol(node: &Node, content: &str, source_start: usize) -> Option<TypeScriptSymbol> {
