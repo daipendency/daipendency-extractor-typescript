@@ -1,3 +1,8 @@
+mod module;
+mod parsing;
+#[cfg(test)]
+mod test_helpers;
+
 use daipendency_extractor::{ExtractionError, LibraryMetadata, Namespace, Symbol};
 use tree_sitter::{Node, Parser};
 
@@ -49,11 +54,9 @@ fn process_node(
                     let mut var_cursor = child.walk();
                     for var_child in child.children(&mut var_cursor) {
                         if var_child.kind() == "variable_declarator" {
-                            let name = get_declaration_name(&var_child, source_code)
-                                .ok_or_else(|| {
-                                    ExtractionError::Malformed(
-                                        "Variable without name".to_string(),
-                                    )
+                            let name =
+                                get_declaration_name(&var_child, source_code).ok_or_else(|| {
+                                    ExtractionError::Malformed("Variable without name".to_string())
                                 })?;
                             namespaces[0].symbols.push(Symbol {
                                 name,
@@ -104,18 +107,9 @@ fn get_node_text(node: Node, source_code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::make_parser;
     use super::*;
-    use crate::TypeScriptExtractor;
-    use daipendency_extractor::Extractor;
     use daipendency_testing::{debug_node, tempdir::TempDir};
-    use tree_sitter::Parser;
-
-    fn make_parser() -> Parser {
-        let mut parser = Parser::new();
-        let language = TypeScriptExtractor.get_parser_language();
-        parser.set_language(&language).unwrap();
-        parser
-    }
 
     fn setup_test_dir(content: &str) -> (TempDir, LibraryMetadata) {
         let temp_dir = TempDir::new();

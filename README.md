@@ -1,2 +1,3 @@
 # daipendency-extractor-typescript
-Daipendency extractor for TypeScript libraries
+
+Daipendency extractor for TypeScript declarations.
