@@ -1,13 +1,45 @@
 use std::collections::HashMap;
 
 use daipendency_extractor::{ExtractionError, Symbol};
-use tree_sitter::{Node, Parser};
+use streaming_iterator::StreamingIterator;
+use tree_sitter::QueryMatches;
+use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
+use tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
 
 use crate::api::module::{ExportTarget, ImportTarget, Module, TypeScriptSymbol};
 
 // TODO: REMOVE WHEN ALL TESTS ARE FIXED
 #[cfg(test)]
 use daipendency_testing::debug_node;
+
+const SYMBOLS_QUERY: &str = r#"
+(class_declaration
+    name: (type_identifier) @name
+    ) @declaration
+
+(abstract_class_declaration
+    name: (type_identifier) @name
+    ) @declaration
+
+(interface_declaration
+  name: (type_identifier) @name) @declaration
+
+(function_signature
+    name: (identifier) @name
+    ) @declaration
+
+(type_alias_declaration
+  name: (type_identifier) @name) @declaration
+
+(enum_declaration
+  name: (identifier) @name) @declaration
+
+(lexical_declaration
+    (variable_declarator
+        name: (identifier) @name
+        )
+    ) @declaration
+"#;
 
 pub fn parse_typescript_file(
     content: &str,
@@ -18,10 +50,6 @@ pub fn parse_typescript_file(
         .ok_or_else(|| ExtractionError::Malformed("Failed to parse source file".to_string()))?;
     let node = tree.root_node();
 
-    // TODO: REMOVE WHEN ALL TESTS ARE FIXED
-    #[cfg(test)]
-    println!("{}", debug_node(&node, content));
-
     if node.has_error() {
         return Err(ExtractionError::Malformed(
             "Failed to parse source file".to_string(),
@@ -29,7 +57,7 @@ pub fn parse_typescript_file(
     }
 
     let jsdoc = get_module_jsdoc(node, content);
-    let (symbols, default_export_name) = get_file_symbols(node, content);
+    let (symbols, default_export_name) = get_module_symbols(node, content);
 
     Ok(Module {
         jsdoc,
@@ -53,447 +81,78 @@ fn get_module_jsdoc<'a>(node: Node<'a>, content: &'a str) -> Option<String> {
     })
 }
 
-fn get_file_symbols(node: Node, content: &str) -> (Vec<TypeScriptSymbol>, Option<String>) {
-    let mut module_symbols = vec![];
-    let mut module_exported_names = vec![];
-    let mut default_export_name = None;
+/// Extracts all symbols from the module.
+///
+/// # Arguments
+///
+/// * `node` - The root node of the TypeScript AST
+/// * `content` - The source code content as a string
+///
+/// # Returns
+///
+/// A tuple containing:
+/// * A vector of all symbols found in the module
+/// * The name of the default export if one exists, otherwise None
+fn get_module_symbols(root: Node, content: &str) -> (Vec<TypeScriptSymbol>, Option<String>) {
+    // TODO: REMOVE WHEN ALL TESTS ARE FIXED
+    #[cfg(test)]
+    println!("root: {}", debug_node(&root, content));
 
-    // Extract symbols and track exports
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "export_statement" => {
-                let (symbols, exported, default) = extract_exports(&child, content);
-                module_symbols.extend(symbols);
-                module_exported_names.extend(exported);
-                if default.is_some() {
-                    default_export_name = default;
-                }
-            }
-            "import_statement" => {
-                let symbols = extract_imports(&child, content);
-                module_symbols.extend(symbols);
-            }
-            "ambient_declaration" => {
-                if let Some(symbol) = extract_ambient(&child, content, false) {
-                    module_symbols.push(symbol);
-                }
-            }
-            "expression_statement" => {
-                if let Some(symbol) = extract_namespace(&child, content) {
-                    module_symbols.push(symbol);
-                }
-            }
-            "class_declaration"
-            | "interface_declaration"
-            | "type_alias_declaration"
-            | "enum_declaration" => {
-                let prev_sibling = child.prev_sibling();
-                let jsdoc = prev_sibling
-                    .filter(|n| n.kind() == "comment")
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok());
-                let source_start = jsdoc
-                    .as_ref()
-                    .map_or(child.start_byte(), |_| prev_sibling.unwrap().start_byte());
-                if let Some(symbol) = extract_symbol(&child, content, source_start) {
-                    module_symbols.push(symbol);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Update exported flag for symbols that are exported
-    for symbol in &mut module_symbols {
-        if let TypeScriptSymbol::Symbol { symbol, exported } = symbol {
-            if module_exported_names.contains(&symbol.name) {
-                *exported = true;
-            }
-        }
-    }
-
-    (module_symbols, default_export_name)
-}
-
-fn extract_symbol(node: &Node, content: &str, source_start: usize) -> Option<TypeScriptSymbol> {
-    let name = node
-        .child_by_field_name("name")?
-        .utf8_text(content.as_bytes())
-        .ok()?;
-    let source_code = &content[source_start..node.end_byte()];
-    Some(TypeScriptSymbol::Symbol {
-        symbol: Symbol {
-            name: name.to_string(),
-            source_code: source_code.to_string(),
-        },
-        exported: false,
-    })
-}
-
-fn extract_imports(node: &Node, content: &str) -> Vec<TypeScriptSymbol> {
-    let mut cursor = node.walk();
-    let mut children = node.children(&mut cursor);
     let mut symbols = vec![];
+    let default_export_name = None;
+    let mut cursor = QueryCursor::new();
+    let query =
+        Query::new(&LANGUAGE_TYPESCRIPT.into(), SYMBOLS_QUERY).expect("Failed to create query");
 
-    // Skip "import" keyword
-    if children.next().is_none() {
-        return symbols;
-    }
+    let capture_names = query.capture_names();
+    let name_index = capture_names
+        .iter()
+        .position(|name| *name == "name")
+        .expect("Name capture not found") as u32;
+    let definition_index = capture_names
+        .iter()
+        .position(|name| *name == "declaration")
+        .expect("Declaration capture not found") as u32;
 
-    // Get import clause
-    let import_clause = match children.next() {
-        Some(clause) => clause,
-        None => return symbols,
-    };
+    let matches = cursor.matches(&query, root, content.as_bytes());
+    matches.for_each(|match_| {
+        let name_node = match_.nodes_for_capture_index(name_index).next().unwrap();
+        let mut definition_node = match_
+            .nodes_for_capture_index(definition_index)
+            .next()
+            .unwrap();
 
-    // Skip "from" keyword
-    if children.next().is_none() {
-        return symbols;
-    }
+        let name = name_node.utf8_text(content.as_bytes()).unwrap().to_string();
 
-    // Get source module
-    let source_module = match children
-        .next()
-        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-        .map(|s| s.trim_matches('\'').to_string())
-    {
-        Some(module) => module,
-        None => return symbols,
-    };
-
-    if import_clause.kind() == "import_clause" {
-        let mut cursor = import_clause.walk();
-        let children = import_clause.children(&mut cursor);
-
-        for child in children {
-            match child.kind() {
-                "identifier" => {
-                    let name = match child.utf8_text(content.as_bytes()).ok() {
-                        Some(name) => name.to_string(),
-                        None => continue,
-                    };
-                    symbols.push(TypeScriptSymbol::ModuleImport {
-                        source_module: source_module.clone(),
-                        target: ImportTarget::Default { name },
-                    });
-                }
-                "namespace_import" => {
-                    let mut cursor = child.walk();
-                    let mut children = child.children(&mut cursor);
-
-                    // Skip "*" and "as" tokens
-                    children.next();
-                    children.next();
-
-                    // Get the name
-                    if let Some(name) = children
-                        .next()
-                        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    {
-                        symbols.push(TypeScriptSymbol::ModuleImport {
-                            source_module: source_module.clone(),
-                            target: ImportTarget::Namespace {
-                                name: name.to_string(),
-                            },
-                        });
-                    }
-                }
-                "named_imports" => {
-                    let mut names = vec![];
-                    let mut cursor = child.walk();
-                    let mut aliases = HashMap::new();
-                    for import_specifier in child.children(&mut cursor) {
-                        if import_specifier.kind() == "import_specifier" {
-                            let mut specifier_cursor = import_specifier.walk();
-                            let mut specifier_children =
-                                import_specifier.children(&mut specifier_cursor);
-                            if let Some(name_node) = specifier_children.next() {
-                                if name_node.kind() == "identifier" {
-                                    if let Ok(name) = name_node.utf8_text(content.as_bytes()) {
-                                        // Check for alias
-                                        if let Some(alias_node) =
-                                            specifier_children.find(|n| n.kind() == "identifier")
-                                        {
-                                            if let Ok(alias) =
-                                                alias_node.utf8_text(content.as_bytes())
-                                            {
-                                                aliases.insert(name.to_string(), alias.to_string());
-                                            }
-                                        }
-                                        names.push(name.to_string());
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if !names.is_empty() {
-                        symbols.push(TypeScriptSymbol::ModuleImport {
-                            source_module: source_module.clone(),
-                            target: ImportTarget::Named { names, aliases },
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    symbols
-}
-
-fn extract_exports(
-    node: &Node,
-    content: &str,
-) -> (Vec<TypeScriptSymbol>, Vec<String>, Option<String>) {
-    let mut cursor = node.walk();
-    let mut children = node.children(&mut cursor);
-    let mut symbols = vec![];
-    let mut exported_names = vec![];
-    let mut default_export_name = None;
-
-    // Skip "export" keyword
-    children.next();
-
-    if let Some(first_child) = children.next() {
-        match first_child.kind() {
-            "default" => {
-                // Handle "export default ..."
-                if let Some(next_child) = children.next() {
-                    match next_child.kind() {
-                        "ambient_declaration" => {
-                            if let Some(symbol) = extract_ambient(&next_child, content, true) {
-                                if let TypeScriptSymbol::Symbol { symbol, .. } = &symbol {
-                                    exported_names.push(symbol.name.clone());
-                                    default_export_name = Some(symbol.name.clone());
-                                }
-                                symbols.push(symbol);
-                            }
-                        }
-                        "identifier" => {
-                            if let Ok(name) = next_child.utf8_text(content.as_bytes()) {
-                                exported_names.push(name.to_string());
-                                default_export_name = Some(name.to_string());
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            "=" => {
-                // Handle CommonJS export (export = ...)
-                if let Some(next_child) = children.next() {
-                    if next_child.kind() == "identifier" {
-                        if let Ok(name) = next_child.utf8_text(content.as_bytes()) {
-                            exported_names.push(name.to_string());
-                        }
-                    }
-                }
-            }
-            "ambient_declaration" => {
-                if let Some(symbol) = extract_ambient(&first_child, content, true) {
-                    if let TypeScriptSymbol::Symbol { symbol, .. } = &symbol {
-                        exported_names.push(symbol.name.clone());
-                    }
-                    symbols.push(symbol);
-                }
-            }
-            "export_clause" => {
-                let mut specifier_cursor = first_child.walk();
-                let mut names = vec![];
-                let mut aliases = HashMap::new();
-
-                for export_specifier in first_child.children(&mut specifier_cursor) {
-                    if export_specifier.kind() == "export_specifier" {
-                        let mut specifier_cursor = export_specifier.walk();
-                        let mut specifier_children =
-                            export_specifier.children(&mut specifier_cursor);
-                        if let Some(name_node) = specifier_children.next() {
-                            if name_node.kind() == "identifier" {
-                                if let Ok(name) = name_node.utf8_text(content.as_bytes()) {
-                                    names.push(name.to_string());
-
-                                    // Check for alias
-                                    if let Some(alias_node) =
-                                        specifier_children.find(|n| n.kind() == "identifier")
-                                    {
-                                        if let Ok(alias) = alias_node.utf8_text(content.as_bytes())
-                                        {
-                                            aliases.insert(name.to_string(), alias.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Skip "from" keyword
-                if let Some(from_node) = children.next() {
-                    if from_node.kind() != "from" {
-                        // This is a local export, not a re-export
-                        exported_names.extend(names);
-                    } else {
-                        // Get source module
-                        if let Some(source_module) = children
-                            .next()
-                            .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                        {
-                            let source_module = source_module.trim_matches('\'').to_string();
-
-                            symbols.push(TypeScriptSymbol::ModuleExport {
-                                source_module,
-                                target: ExportTarget::Named { names, aliases },
-                            });
-                        }
-                    }
-                }
-            }
-            "*" => {
-                // Skip "from" keyword
-                children.next();
-
-                // Get source module
-                if let Some(source_module) = children
-                    .next()
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                {
-                    let source_module = source_module.trim_matches('\'').to_string();
-                    symbols.push(TypeScriptSymbol::ModuleExport {
-                        source_module,
-                        target: ExportTarget::Barrel,
-                    });
-                }
-            }
-            "namespace_export" => {
-                let mut cursor = first_child.walk();
-                let mut namespace_children = first_child.children(&mut cursor);
-
-                // Skip "*" token
-                namespace_children.next();
-                // Skip "as" token
-                namespace_children.next();
-
-                // Get the name
-                if let Some(name) = namespace_children
-                    .next()
-                    .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                {
-                    // Skip "from" keyword
-                    children.next();
-
-                    // Get source module
-                    if let Some(source_module) = children
-                        .next()
-                        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
-                    {
-                        let source_module = source_module.trim_matches('\'').to_string();
-                        symbols.push(TypeScriptSymbol::ModuleExport {
-                            source_module,
-                            target: ExportTarget::Namespace {
-                                name: name.to_string(),
-                            },
-                        });
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    (symbols, exported_names, default_export_name)
-}
-
-fn extract_ambient(node: &Node, content: &str, exported: bool) -> Option<TypeScriptSymbol> {
-    let declaration = node.child(1)?;
-    let source_start = if exported {
-        // If exported, we need to include the entire export statement
-        node.parent()?.start_byte()
-    } else {
-        // Otherwise, include JSDoc if present
-        get_jsdoc(node.prev_sibling(), content).map_or(node.start_byte(), |_| {
-            node.prev_sibling().unwrap().start_byte()
-        })
-    };
-    let source_end = if exported {
-        // If exported, we need to include the entire export statement
-        node.parent()?.end_byte()
-    } else {
-        node.end_byte()
-    };
-    let source_code = &content[source_start..source_end];
-    match declaration.kind() {
-        "function_signature" => {
-            let name = declaration
-                .child_by_field_name("name")?
-                .utf8_text(content.as_bytes())
-                .ok()?;
-            Some(TypeScriptSymbol::Symbol {
-                symbol: Symbol {
-                    name: name.to_string(),
-                    source_code: source_code.to_string(),
-                },
-                exported,
-            })
-        }
-        "lexical_declaration" => {
-            let variable = declaration.child(1)?;
-            let name = variable
-                .child_by_field_name("name")?
-                .utf8_text(content.as_bytes())
-                .ok()?;
-            Some(TypeScriptSymbol::Symbol {
-                symbol: Symbol {
-                    name: name.to_string(),
-                    source_code: source_code.to_string(),
-                },
-                exported,
-            })
-        }
-        "class_declaration" => {
-            let name = declaration
-                .child_by_field_name("name")?
-                .utf8_text(content.as_bytes())
-                .ok()?;
-            Some(TypeScriptSymbol::Symbol {
-                symbol: Symbol {
-                    name: name.to_string(),
-                    source_code: source_code.to_string(),
-                },
-                exported,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn extract_namespace(node: &Node, content: &str) -> Option<TypeScriptSymbol> {
-    if let Some(internal_module) = node.child(0).filter(|n| n.kind() == "internal_module") {
-        let name = internal_module
-            .child_by_field_name("name")?
-            .utf8_text(content.as_bytes())
-            .ok()?;
-        let statement_block = internal_module.child_by_field_name("body")?;
-        let mut content_symbols = vec![];
-        let mut cursor = statement_block.walk();
-        for child in statement_block.children(&mut cursor) {
-            let kind = child.kind();
-            if let Some(symbol) = match kind {
-                "ambient_declaration" => extract_ambient(&child, content, false),
-                _ => None,
-            } {
-                content_symbols.push(symbol);
+        if let Some(parent) = definition_node.parent() {
+            if parent.kind() == "ambient_declaration" {
+                definition_node = parent;
             }
         }
 
-        Some(TypeScriptSymbol::Namespace {
-            name: name.to_string(),
-            content: content_symbols,
+        // Get the full source code including any preceding comments
+        let mut start_byte = definition_node.start_byte();
+        let end_byte = definition_node.end_byte();
+
+        // Check if there's a preceding comment
+        if let Some(prev) = definition_node.prev_sibling() {
+            if prev.kind() == "comment" {
+                start_byte = prev.start_byte();
+            }
+        }
+
+        // Get the source code
+        let source_code = content[start_byte..end_byte].to_string();
+
+        let symbol = Symbol { name, source_code };
+
+        symbols.push(TypeScriptSymbol::Symbol {
+            symbol,
             exported: false,
-            jsdoc: get_jsdoc(node.prev_sibling(), content),
-        })
-    } else {
-        None
-    }
+        });
+    });
+
+    (symbols, default_export_name)
 }
 
 #[cfg(test)]
@@ -595,6 +254,16 @@ mod tests {
         fn class_declaration() {
             let mut parser = make_parser();
             let content = "declare class Foo { bar(): void; }";
+
+            let result = parse_typescript_file(content, &mut parser);
+
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "Foo" && symbol.source_code == content));
+        }
+
+        #[test]
+        fn abstract_class_declaration() {
+            let mut parser = make_parser();
+            let content = "declare abstract class Foo { bar(): void; }";
 
             let result = parse_typescript_file(content, &mut parser);
 

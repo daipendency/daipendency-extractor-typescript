@@ -59,6 +59,7 @@ dependencies = [
  "daipendency-testing",
  "serde",
  "serde_json",
+ "streaming-iterator",
  "tree-sitter",
  "tree-sitter-typescript",
 ]
