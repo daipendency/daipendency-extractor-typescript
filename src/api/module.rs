@@ -58,7 +58,7 @@ pub enum TypeScriptSymbol {
     Symbol {
         symbol: Symbol,
         /// Whether the symbol is exported (either when declared, or later in the file).
-        exported: bool,
+        is_exported: bool,
     },
     /// A TypeScript namespace.
     Namespace {

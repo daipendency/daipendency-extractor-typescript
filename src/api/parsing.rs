@@ -99,7 +99,7 @@ fn get_module_symbols(root: Node, content: &str) -> (Vec<TypeScriptSymbol>, Opti
     println!("root: {}", debug_node(&root, content));
 
     let mut symbols = vec![];
-    let default_export_name = None;
+    let mut default_export_name = None;
     let mut cursor = QueryCursor::new();
     let query =
         Query::new(&LANGUAGE_TYPESCRIPT.into(), SYMBOLS_QUERY).expect("Failed to create query");
@@ -130,10 +130,25 @@ fn get_module_symbols(root: Node, content: &str) -> (Vec<TypeScriptSymbol>, Opti
             }
         }
 
+        let mut is_exported = false;
+        if let Some(parent) = definition_node.parent() {
+            if parent.kind() == "export_statement" {
+                definition_node = parent;
+                is_exported = true;
+
+                let mut cursor = definition_node.walk();
+                if definition_node
+                    .children(&mut cursor)
+                    .any(|child| child.kind() == "default")
+                {
+                    default_export_name = Some(name.clone());
+                }
+            }
+        }
+
         // Get the full source code including any preceding comments
         let mut start_byte = definition_node.start_byte();
         let end_byte = definition_node.end_byte();
-
         // Check if there's a preceding comment
         if let Some(prev) = definition_node.prev_sibling() {
             if prev.kind() == "comment" {
@@ -148,7 +163,7 @@ fn get_module_symbols(root: Node, content: &str) -> (Vec<TypeScriptSymbol>, Opti
 
         symbols.push(TypeScriptSymbol::Symbol {
             symbol,
-            exported: false,
+            is_exported,
         });
     });
 
@@ -257,7 +272,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "Foo" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "Foo" && symbol.source_code == content));
         }
 
         #[test]
@@ -267,7 +282,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "Foo" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "Foo" && symbol.source_code == content));
         }
 
         #[test]
@@ -277,7 +292,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "Bar" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "Bar" && symbol.source_code == content));
         }
 
         #[test]
@@ -287,7 +302,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "Baz" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "Baz" && symbol.source_code == content));
         }
 
         #[test]
@@ -297,7 +312,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "Status" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "Status" && symbol.source_code == content));
         }
 
         #[test]
@@ -307,7 +322,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "greet" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "greet" && symbol.source_code == content));
         }
 
         #[test]
@@ -317,7 +332,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "VERSION" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "VERSION" && symbol.source_code == content));
         }
 
         #[test]
@@ -327,7 +342,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "counter" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "counter" && symbol.source_code == content));
         }
 
         #[test]
@@ -337,7 +352,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "VERSION" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "VERSION" && symbol.source_code == content));
         }
 
         #[test]
@@ -347,7 +362,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: false } if symbol.name == "VERSION" && symbol.source_code == content));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.name == "VERSION" && symbol.source_code == content));
         }
     }
 
@@ -361,7 +376,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: true } if symbol.name == "VERSION" && symbol.source_code.contains("declare const VERSION: string")));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "VERSION" && symbol.source_code.contains("declare const VERSION: string")));
         }
 
         #[test]
@@ -369,9 +384,11 @@ mod tests {
             let mut parser = make_parser();
             let content = "export declare function greet(name: string): void;";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: true } if symbol.name == "greet" && symbol.source_code == content));
+            assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
+            let symbol = &module.symbols[0];
+            assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "greet" && symbol.source_code == content);
         }
 
         #[test]
@@ -383,7 +400,7 @@ mod tests {
 
             assert_matches!(&module, Module { symbols, default_export_name: Some(n), .. } if symbols.len() == 1 && n == "greet");
             let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, exported: true } if symbol.name == "greet" && symbol.source_code == content);
+            assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "greet" && symbol.source_code == content);
         }
 
         #[test]
@@ -395,7 +412,7 @@ mod tests {
 
             assert_matches!(&module, Module { symbols, default_export_name: Some(n), .. } if symbols.len() == 1 && n == "VERSION");
             let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, exported: true } if symbol.name == "VERSION" && symbol.source_code.contains("declare const VERSION: string"));
+            assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "VERSION" && symbol.source_code.contains("declare const VERSION: string"));
         }
 
         #[test]
@@ -405,7 +422,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, exported: true } if symbol.name == "myFunction" && symbol.source_code.contains("declare function myFunction(): void")));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "myFunction" && symbol.source_code.contains("declare function myFunction(): void")));
         }
     }
 
