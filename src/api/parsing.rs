@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-
 use daipendency_extractor::{ExtractionError, Symbol};
+use std::collections::HashMap;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::QueryMatches;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
 
 use crate::api::module::{ExportTarget, ImportTarget, Module, TypeScriptSymbol};
@@ -38,6 +36,15 @@ const SYMBOLS_QUERY: &str = r#"
         name: (identifier) @name
         )
     ) @declaration
+"#;
+
+const IMPORT_QUERY: &str = r#"
+(import_statement
+    (import_clause) @target
+    source: (string
+        (string_fragment) @source
+        )
+    )
 "#;
 
 pub fn parse_typescript_file(
@@ -103,7 +110,11 @@ fn get_module_symbols(
     content: &str,
     language: &Language,
 ) -> (Vec<TypeScriptSymbol>, Option<String>) {
-    extract_symbols(root, content, language)
+    let (mut symbols, default_export_name) = extract_symbols(root, content, language);
+
+    symbols.extend(extract_imports(root, content, language));
+
+    (symbols, default_export_name)
 }
 
 fn extract_symbols<'a>(
@@ -177,6 +188,100 @@ fn extract_symbols<'a>(
     });
 
     (symbols, default_export_name)
+}
+
+fn extract_imports<'a>(
+    root: Node<'a>,
+    content: &'a str,
+    language: &Language,
+) -> Vec<TypeScriptSymbol> {
+    let mut imports = vec![];
+    let query = Query::new(language, IMPORT_QUERY).expect("Failed to create query");
+
+    let target_index = query
+        .capture_index_for_name("target")
+        .expect("Target capture not found");
+    let source_index = query
+        .capture_index_for_name("source")
+        .expect("Source capture not found");
+
+    let mut cursor = QueryCursor::new();
+    let matches = cursor.matches(&query, root, content.as_bytes());
+    matches.for_each(|match_| {
+        let source_node = match_.nodes_for_capture_index(source_index).next().unwrap();
+        let source_module = source_node
+            .utf8_text(content.as_bytes())
+            .unwrap()
+            .to_string();
+
+        let target_node = match_.nodes_for_capture_index(target_index).next().unwrap();
+        let mut target_cursor = target_node.walk();
+        let subtarget_nodes = target_node.children(&mut target_cursor);
+
+        let targets = subtarget_nodes.filter_map(|child| match child.kind() {
+            "identifier" => Some(TypeScriptSymbol::ModuleImport {
+                source_module: source_module.clone(),
+                target: ImportTarget::Default {
+                    name: extract_identifier_text(child, content).unwrap(),
+                },
+            }),
+            "namespace_import" => {
+                let mut namespace_cursor = child.walk();
+                let name = child
+                    .children(&mut namespace_cursor)
+                    .find_map(|n| extract_identifier_text(n, content))
+                    .unwrap();
+                Some(TypeScriptSymbol::ModuleImport {
+                    source_module: source_module.clone(),
+                    target: ImportTarget::Namespace { name },
+                })
+            }
+            "named_imports" => {
+                let mut names = Vec::new();
+                let mut aliases = HashMap::new();
+                let mut named_cursor = child.walk();
+
+                for import_specifier in child
+                    .children(&mut named_cursor)
+                    .filter(|n| n.kind() == "import_specifier")
+                {
+                    let mut specifier_cursor = import_specifier.walk();
+                    let mut children = import_specifier.children(&mut specifier_cursor);
+
+                    let name = children
+                        .next()
+                        .and_then(|n| extract_identifier_text(n, content))
+                        .unwrap();
+                    names.push(name.clone());
+
+                    if let Some(alias) = children.find_map(|n| extract_identifier_text(n, content))
+                    {
+                        aliases.insert(name, alias);
+                    }
+                }
+
+                Some(TypeScriptSymbol::ModuleImport {
+                    source_module: source_module.clone(),
+                    target: ImportTarget::Named { names, aliases },
+                })
+            }
+            _ => None,
+        });
+
+        imports.extend(targets);
+    });
+
+    imports
+}
+
+fn extract_identifier_text(node: Node, content: &str) -> Option<String> {
+    if node.kind() == "identifier" {
+        node.utf8_text(content.as_bytes())
+            .ok()
+            .map(|s| s.to_string())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -599,6 +704,20 @@ mod tests {
             let named_import = &module.symbols[1];
             assert_matches!(named_import, TypeScriptSymbol::ModuleImport { source_module, .. } if source_module == "./foo.js");
             assert_matches!(named_import, TypeScriptSymbol::ModuleImport { target, .. } if matches!(target, ImportTarget::Named { names, aliases } if *names == vec!["bar".to_string()] && aliases.is_empty()));
+        }
+
+        #[test]
+        fn multiple_named_imports() {
+            let mut parser = make_parser();
+            let content = "import { foo, bar as baz } from './foo.js';";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+
+            let named_import = &module.symbols[0];
+            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { source_module, .. } if source_module == "./foo.js");
+            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { target, .. } if matches!(target, ImportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases == &HashMap::from([("bar".to_string(), "baz".to_string())])));
         }
     }
 
