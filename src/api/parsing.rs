@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
 
-use crate::api::module::{ExportTarget, ImportTarget, Module, TypeScriptSymbol};
+use crate::api::module::{ImportTarget, Module, TypeScriptSymbol};
 
 // TODO: REMOVE WHEN ALL TESTS ARE FIXED
 #[cfg(test)]
@@ -66,7 +66,7 @@ pub fn parse_typescript_file(
     #[cfg(test)]
     println!("root: {}", debug_node(&node, content));
 
-    let jsdoc = get_module_jsdoc(node, content);
+    let jsdoc = get_jsdoc(node.child(0), content).filter(|s| is_module_jsdoc(s.as_str()));
     let (symbols, default_export_name) =
         get_module_symbols(node, content, &parser.language().unwrap());
 
@@ -77,10 +77,6 @@ pub fn parse_typescript_file(
     })
 }
 
-fn get_module_jsdoc<'a>(node: Node<'a>, content: &'a str) -> Option<String> {
-    get_jsdoc(node.child(0), content).filter(is_module_jsdoc)
-}
-
 fn get_jsdoc(node: Option<Node>, content: &str) -> Option<String> {
     node.filter(|n| n.kind() == "comment")
         .and_then(|n| n.utf8_text(content.as_bytes()).ok())
@@ -88,7 +84,7 @@ fn get_jsdoc(node: Option<Node>, content: &str) -> Option<String> {
         .map(|comment| comment.to_string())
 }
 
-fn is_module_jsdoc(comment: &String) -> bool {
+fn is_module_jsdoc(comment: &str) -> bool {
     comment.contains("@file") || comment.contains("@fileoverview") || comment.contains("@module")
 }
 
@@ -113,6 +109,7 @@ fn get_module_symbols(
     let (mut symbols, default_export_name) = extract_symbols(root, content, language);
 
     symbols.extend(extract_imports(root, content, language));
+    symbols.extend(extract_namespaces(root, content, language));
 
     (symbols, default_export_name)
 }
@@ -141,6 +138,11 @@ fn extract_symbols<'a>(
             .nodes_for_capture_index(definition_index)
             .next()
             .unwrap();
+
+        // Skip symbols that are inside a namespace
+        if has_namespace_ancestor(definition_node, root) {
+            return;
+        }
 
         let name = name_node.utf8_text(content.as_bytes()).unwrap().to_string();
 
@@ -188,6 +190,20 @@ fn extract_symbols<'a>(
     });
 
     (symbols, default_export_name)
+}
+
+fn has_namespace_ancestor(node: Node, root: Node) -> bool {
+    if let Some(parent) = node.parent() {
+        if parent.id() == root.id() {
+            false
+        } else if parent.kind() == "internal_module" {
+            true
+        } else {
+            has_namespace_ancestor(parent, root)
+        }
+    } else {
+        false
+    }
 }
 
 fn extract_imports<'a>(
@@ -282,6 +298,70 @@ fn extract_identifier_text(node: Node, content: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn extract_namespaces<'a>(
+    root: Node<'a>,
+    content: &'a str,
+    language: &Language,
+) -> Vec<TypeScriptSymbol> {
+    let mut namespaces = vec![];
+    let query = Query::new(
+        language,
+        r#"
+        (internal_module
+            name: (identifier) @name
+            body: (statement_block) @body)
+    "#,
+    )
+    .expect("Failed to create query");
+
+    let name_index = query
+        .capture_index_for_name("name")
+        .expect("Name capture not found");
+    let body_index = query
+        .capture_index_for_name("body")
+        .expect("Body capture not found");
+
+    let mut cursor = QueryCursor::new();
+    let matches = cursor.matches(&query, root, content.as_bytes());
+    matches.for_each(|match_| {
+        let name_node = match_.nodes_for_capture_index(name_index).next().unwrap();
+        let namespace_node = name_node.parent().unwrap();
+
+        if has_namespace_ancestor(namespace_node, root) {
+            return;
+        }
+
+        let name = name_node.utf8_text(content.as_bytes()).unwrap().to_string();
+
+        let body_node = match_.nodes_for_capture_index(body_index).next().unwrap();
+        let (inner_content, _) = get_module_symbols(body_node, content, language);
+
+        let mut is_exported = false;
+        let mut current_node = namespace_node;
+        if let Some(parent) = current_node.parent() {
+            if parent.kind() == "export_statement" {
+                is_exported = true;
+                current_node = parent;
+            }
+        }
+
+        let jsdoc = if let Some(expression_statement) = current_node.parent() {
+            get_jsdoc(expression_statement.prev_sibling(), content)
+        } else {
+            None
+        };
+
+        namespaces.push(TypeScriptSymbol::Namespace {
+            name,
+            content: inner_content,
+            is_exported,
+            jsdoc,
+        });
+    });
+
+    namespaces
 }
 
 #[cfg(test)]
@@ -592,9 +672,12 @@ mod tests {
             let mut parser = make_parser();
             let content = "namespace Foo {}";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Namespace { name, content, exported: false, jsdoc: None } if name == "Foo" && content.is_empty()));
+            assert_eq!(module.symbols.len(), 1);
+            let namespace = &module.symbols[0];
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { content, .. } if content.is_empty());
         }
 
         #[test]
@@ -602,20 +685,68 @@ mod tests {
             let mut parser = make_parser();
             let content = "namespace Foo { declare const VERSION: string; }";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Namespace { name, content, exported: false, jsdoc: None } if name == "Foo" && content.len() == 1));
+            assert_eq!(module.symbols.len(), 1);
+            let namespace = &module.symbols[0];
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { content, .. } if content.len() == 1);
         }
 
         #[test]
-        fn namespace_with_symbols() {
+        fn exported_namespace() {
+            let mut parser = make_parser();
+            let content = "export namespace Foo { declare const VERSION: string; }";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_eq!(module.symbols.len(), 1);
+            let namespace = &module.symbols[0];
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
+            assert_matches!(
+                namespace,
+                TypeScriptSymbol::Namespace {
+                    is_exported: true,
+                    ..
+                }
+            );
+        }
+
+        #[test]
+        fn namespace_with_multiple_symbols() {
             let mut parser = make_parser();
             let content =
                 "namespace Foo { declare const VERSION: string; declare function greet(): void; }";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Namespace { name, content, jsdoc: None, .. } if name == "Foo" && content.len() == 2));
+            assert_eq!(module.symbols.len(), 1);
+            let namespace = &module.symbols[0];
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { content, .. } if content.len() == 2);
+        }
+
+        #[test]
+        fn namespace_with_inner_namespace() {
+            let mut parser = make_parser();
+            let content =
+                "namespace Foo { namespace Bar { export declare const VERSION: string; } }";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_eq!(module.symbols.len(), 1);
+            let outer_namespace = &module.symbols[0];
+            assert_matches!(outer_namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
+            let inner_namespace = match &outer_namespace {
+                TypeScriptSymbol::Namespace { content, .. } if content.len() == 1 => &content[0],
+                _ => panic!("Expected namespace"),
+            };
+            assert_matches!(inner_namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Bar");
+            let symbol = match &inner_namespace {
+                TypeScriptSymbol::Namespace { content, .. } if content.len() == 1 => &content[0],
+                _ => panic!("Expected symbol"),
+            };
+            assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "VERSION");
         }
 
         #[test]
@@ -624,9 +755,12 @@ mod tests {
             let content =
                 "/** Utility functions */\nnamespace Foo { declare const VERSION: string; }";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Namespace { name, jsdoc: Some(j), .. } if name == "Foo" && j == "/** Utility functions */"));
+            assert_eq!(module.symbols.len(), 1);
+            let namespace = &module.symbols[0];
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { jsdoc: Some(j), .. } if j == "/** Utility functions */");
         }
 
         #[test]
@@ -634,9 +768,11 @@ mod tests {
             let mut parser = make_parser();
             let content = "namespace Foo { declare const VERSION: string; }";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Namespace { name, jsdoc: None, .. } if name == "Foo"));
+            assert_eq!(module.symbols.len(), 1);
+            let namespace = &module.symbols[0];
+            assert_matches!(namespace, TypeScriptSymbol::Namespace { jsdoc: None, .. });
         }
     }
 
@@ -722,6 +858,8 @@ mod tests {
     }
 
     mod module_exports {
+        use crate::api::module::ExportTarget;
+
         use super::*;
 
         #[test]

@@ -66,7 +66,7 @@ pub enum TypeScriptSymbol {
         jsdoc: Option<String>,
         content: Vec<TypeScriptSymbol>,
         /// Whether the symbol is exported (either when declared, or later in the file).
-        exported: bool,
+        is_exported: bool,
     },
     /// An import from another module (e.g. `import Foo from './foo.js';`).
     ///
