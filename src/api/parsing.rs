@@ -232,13 +232,17 @@ fn extract_symbols<'a>(
             .expect("Failed to get symbol name")
             .to_string();
 
-        let parent = definition_node.parent().expect("Symbol declaration has no parent");
+        let parent = definition_node
+            .parent()
+            .expect("Symbol declaration has no parent");
         if parent.kind() == "ambient_declaration" {
             definition_node = parent;
         }
 
         let mut is_exported = false;
-        let parent = definition_node.parent().expect("Symbol declaration has no parent");
+        let parent = definition_node
+            .parent()
+            .expect("Symbol declaration has no parent");
         if parent.kind() == "export_statement" {
             definition_node = parent;
             is_exported = true;
@@ -842,6 +846,8 @@ mod tests {
     }
 
     mod namespaces {
+        use crate::api::test_helpers::deconstruct_namespace;
+
         use super::*;
 
         #[test]
@@ -912,17 +918,21 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
-            let outer_namespace = &module.symbols[0];
-            assert_matches!(outer_namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
-            let inner_namespace = match &outer_namespace {
-                TypeScriptSymbol::Namespace { content, .. } if content.len() == 1 => &content[0],
-                _ => unreachable!("Expected namespace"),
-            };
-            assert_matches!(inner_namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Bar");
-            let symbol = match &inner_namespace {
-                TypeScriptSymbol::Namespace { content, .. } if content.len() == 1 => &content[0],
-                _ => unreachable!("Expected symbol"),
-            };
+            let (outer_name, outer_content, outer_exported, outer_jsdoc) =
+                deconstruct_namespace(&module.symbols[0]);
+            assert_eq!(outer_name, "Foo");
+            assert_eq!(outer_content.len(), 1);
+            assert!(!outer_exported);
+            assert_eq!(outer_jsdoc, None);
+
+            let (inner_name, inner_content, inner_exported, inner_jsdoc) =
+                deconstruct_namespace(&outer_content[0]);
+            assert_eq!(inner_name, "Bar");
+            assert_eq!(inner_content.len(), 1);
+            assert!(!inner_exported);
+            assert_eq!(inner_jsdoc, None);
+
+            let symbol = &inner_content[0];
             assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "VERSION");
         }
 
@@ -955,15 +965,19 @@ mod tests {
 
     mod imports {
         use super::*;
+        use crate::api::test_helpers::deconstruct_module_import;
 
         #[test]
         fn default_import() {
             let mut parser = make_parser();
             let content = "import foo from './foo.js';";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleImport { source_module, target, .. } if source_module == "./foo.js" && matches!(target, ImportTarget::Default { name } if name == "foo")));
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
+            assert_eq!(source_module, "./foo.js");
+            assert_matches!(target, ImportTarget::Default { name } if name == "foo");
         }
 
         #[test]
@@ -971,35 +985,38 @@ mod tests {
             let mut parser = make_parser();
             let content = "import * as foo from './foo.js';";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleImport { source_module, target, .. } if source_module == "./foo.js" && matches!(target, ImportTarget::Namespace { name } if name == "foo")));
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
+            assert_eq!(source_module, "./foo.js");
+            assert_matches!(target, ImportTarget::Namespace { name } if name == "foo");
         }
 
         #[test]
         fn named_import() {
             let mut parser = make_parser();
             let content = "import { foo } from './foo.js';";
+
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-
-            let named_import = &module.symbols[0];
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { source_module, .. } if source_module == "./foo.js");
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { target, .. } if matches!(target, ImportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases.is_empty()));
+            let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
+            assert_eq!(source_module, "./foo.js");
+            assert_matches!(target, ImportTarget::Named { names, aliases } if names == vec!["foo".to_string()] && aliases.is_empty());
         }
 
         #[test]
         fn named_import_with_alias() {
             let mut parser = make_parser();
             let content = "import { foo as bar } from './foo.js';";
+
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-
-            let named_import = &module.symbols[0];
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { source_module, .. } if source_module == "./foo.js");
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { target, .. } if matches!(target, ImportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases == &HashMap::from([("foo".to_string(), "bar".to_string())])));
+            let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
+            assert_eq!(source_module, "./foo.js");
+            assert_matches!(target, ImportTarget::Named { names, aliases } if names == vec!["foo".to_string()] && aliases == HashMap::from([("foo".to_string(), "bar".to_string())]));
         }
 
         #[test]
@@ -1011,12 +1028,13 @@ mod tests {
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 2);
 
-            let default_import = &module.symbols[0];
-            assert_matches!(default_import, TypeScriptSymbol::ModuleImport { source_module, .. } if source_module == "./foo.js");
-            assert_matches!(default_import, TypeScriptSymbol::ModuleImport { target, .. } if matches!(target, ImportTarget::Default { name } if name == "foo"));
-            let named_import = &module.symbols[1];
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { source_module, .. } if source_module == "./foo.js");
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { target, .. } if matches!(target, ImportTarget::Named { names, aliases } if *names == vec!["bar".to_string()] && aliases.is_empty()));
+            let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
+            assert_eq!(source_module, "./foo.js");
+            assert_matches!(target, ImportTarget::Default { name } if name == "foo");
+
+            let (source_module, target) = deconstruct_module_import(&module.symbols[1]);
+            assert_eq!(source_module, "./foo.js");
+            assert_matches!(target, ImportTarget::Named { names, aliases } if names == vec!["bar".to_string()] && aliases.is_empty());
         }
 
         #[test]
@@ -1027,15 +1045,15 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-
-            let named_import = &module.symbols[0];
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { source_module, .. } if source_module == "./foo.js");
-            assert_matches!(named_import, TypeScriptSymbol::ModuleImport { target, .. } if matches!(target, ImportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases == &HashMap::from([("bar".to_string(), "baz".to_string())])));
+            let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
+            assert_eq!(source_module, "./foo.js");
+            assert_matches!(target, ImportTarget::Named { names, aliases } if names == vec!["foo".to_string(), "bar".to_string()] && aliases == HashMap::from([("bar".to_string(), "baz".to_string())]));
         }
     }
 
     mod exports {
         use super::*;
+        use crate::api::test_helpers::deconstruct_module_export;
 
         #[test]
         fn namespace_export_from_another_module() {
@@ -1045,9 +1063,9 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-            let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Namespace { name } if name == "foo"));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, Some("./foo.js".to_string()));
+            assert_matches!(target, ExportTarget::Namespace { name } if name == "foo");
         }
 
         #[test]
@@ -1058,9 +1076,9 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-            let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases.is_empty()));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, Some("./foo.js".to_string()));
+            assert_matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases.is_empty());
         }
 
         #[test]
@@ -1071,9 +1089,9 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-            let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases == &HashMap::from([("foo".to_string(), "bar".to_string())])));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, Some("./foo.js".to_string()));
+            assert_matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases == HashMap::from([("foo".to_string(), "bar".to_string())]));
         }
 
         #[test]
@@ -1084,9 +1102,9 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-            let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Barrel));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, Some("./foo.js".to_string()));
+            assert_matches!(target, ExportTarget::Barrel);
         }
 
         #[test]
@@ -1097,15 +1115,9 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-            let symbol = &module.symbols[0];
-            assert_matches!(
-                symbol,
-                TypeScriptSymbol::ModuleExport {
-                    source_module: None,
-                    ..
-                }
-            );
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["VERSION".to_string()] && aliases.is_empty()));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, None);
+            assert_matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["VERSION".to_string()] && aliases.is_empty());
         }
 
         #[test]
@@ -1116,15 +1128,9 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-            let symbol = &module.symbols[0];
-            assert_matches!(
-                symbol,
-                TypeScriptSymbol::ModuleExport {
-                    source_module: None,
-                    ..
-                }
-            );
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["myFunction".to_string()] && aliases.is_empty()));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, None);
+            assert_matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["myFunction".to_string()] && aliases.is_empty());
         }
 
         #[test]
@@ -1145,9 +1151,9 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
-            let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./module.js");
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases == &HashMap::from([("bar".to_string(), "baz".to_string())])));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, Some("./module.js".to_string()));
+            assert_matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases == HashMap::from([("bar".to_string(), "baz".to_string())]));
         }
 
         #[test]
@@ -1158,12 +1164,13 @@ mod tests {
             let module = parse_typescript_file(content, &mut parser).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 2);
-            let first_export = &module.symbols[0];
-            assert_matches!(first_export, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
-            assert_matches!(first_export, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases.is_empty()));
-            let second_export = &module.symbols[1];
-            assert_matches!(second_export, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./bar.js");
-            assert_matches!(second_export, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["bar".to_string()] && aliases.is_empty()));
+            let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
+            assert_eq!(source_module, Some("./foo.js".to_string()));
+            assert_matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases.is_empty());
+
+            let (source_module, target) = deconstruct_module_export(&module.symbols[1]);
+            assert_eq!(source_module, Some("./bar.js".to_string()));
+            assert_matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["bar".to_string()] && aliases.is_empty());
         }
     }
 }
