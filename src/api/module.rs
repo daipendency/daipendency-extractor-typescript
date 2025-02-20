@@ -57,7 +57,7 @@ pub enum TypeScriptSymbol {
     /// A symbol (e.g. class, interface, function, constant, type alias).
     Symbol {
         symbol: Symbol,
-        /// Whether the symbol is exported (either when declared, or later in the file).
+        /// Whether the symbol was exported when declared.
         is_exported: bool,
     },
     /// A TypeScript namespace.
@@ -65,7 +65,7 @@ pub enum TypeScriptSymbol {
         name: String,
         jsdoc: Option<String>,
         content: Vec<TypeScriptSymbol>,
-        /// Whether the symbol is exported (either when declared, or later in the file).
+        /// Whether the symbol was exported when declared.
         is_exported: bool,
     },
     /// An import from another module (e.g. `import Foo from './foo.js';`).
@@ -82,7 +82,9 @@ pub enum TypeScriptSymbol {
     /// If a single `export` statement uses multiple types of targets, it will be represented as multiple `ModuleExport` symbols.
     ModuleExport {
         /// The module from which symbols are exported (e.g. `./foo.js` in `export Foo from './foo.js';`).
-        source_module: String,
+        ///
+        /// The source is `None` when the symbol was previously declared or imported in the current file.
+        source_module: Option<String>,
         /// The target of the export (e.g. `Foo` in `export Foo from './foo.js';`).
         target: ExportTarget,
     },

@@ -3,11 +3,26 @@ use std::collections::HashMap;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
 
-use crate::api::module::{ImportTarget, Module, TypeScriptSymbol};
+use crate::api::module::{ExportTarget, ImportTarget, Module, TypeScriptSymbol};
 
-// TODO: REMOVE WHEN ALL TESTS ARE FIXED
-#[cfg(test)]
-use daipendency_testing::debug_node;
+const DEFAULT_EXPORT_QUERY: &str = r#"
+; Default export
+(export_statement
+  "default"
+  value: (identifier) @name
+  )
+
+; Export and declaration
+(export_statement
+  "default"
+  (ambient_declaration
+    "declare"
+    (_
+      name: (_) @name
+      )
+    )
+  )
+"#;
 
 const SYMBOLS_QUERY: &str = r#"
 (class_declaration
@@ -19,17 +34,20 @@ const SYMBOLS_QUERY: &str = r#"
     ) @declaration
 
 (interface_declaration
-  name: (type_identifier) @name) @declaration
+    name: (type_identifier) @name
+    ) @declaration
 
 (function_signature
     name: (identifier) @name
     ) @declaration
 
 (type_alias_declaration
-  name: (type_identifier) @name) @declaration
+    name: (type_identifier) @name
+    ) @declaration
 
 (enum_declaration
-  name: (identifier) @name) @declaration
+    name: (identifier) @name
+    ) @declaration
 
 (lexical_declaration
     (variable_declarator
@@ -47,6 +65,44 @@ const IMPORT_QUERY: &str = r#"
     )
 "#;
 
+const EXPORTS_QUERY: &str = r#"
+; Named exports, with or without source
+(export_statement
+  (export_clause
+    (export_specifier
+      name: (identifier) @name
+      alias: (identifier)? @alias
+      )
+    )
+  source: (
+    string (
+      (string_fragment) @source)
+    )?
+  )
+
+; CommonJS
+(export_statement
+  "="
+  (identifier) @name
+  )
+
+; Namespace export
+(export_statement
+  (namespace_export
+    "*"
+    "as"
+    (identifier) @name
+    )
+  source: (string (string_fragment) @source)
+  )
+
+; Barrel export
+(export_statement
+  "*"
+  source: (string (string_fragment) @source)
+  ) @barrel_export
+"#;
+
 pub fn parse_typescript_file(
     content: &str,
     parser: &mut Parser,
@@ -54,21 +110,20 @@ pub fn parse_typescript_file(
     let tree = parser
         .parse(content, None)
         .ok_or_else(|| ExtractionError::Malformed("Failed to parse source file".to_string()))?;
-    let node = tree.root_node();
+    let root_node = tree.root_node();
 
-    if node.has_error() {
+    if root_node.has_error() {
         return Err(ExtractionError::Malformed(
             "Failed to parse source file".to_string(),
         ));
     }
 
-    // TODO: REMOVE WHEN ALL TESTS ARE FIXED
-    #[cfg(test)]
-    println!("root: {}", debug_node(&node, content));
-
-    let jsdoc = get_jsdoc(node.child(0), content).filter(|s| is_module_jsdoc(s.as_str()));
-    let (symbols, default_export_name) =
-        get_module_symbols(node, content, &parser.language().unwrap());
+    let jsdoc = get_jsdoc(root_node.child(0), content).filter(|s| is_module_jsdoc(s.as_str()));
+    let language = parser
+        .language()
+        .expect("Failed to get language from parser");
+    let symbols = get_module_symbols(root_node, content, &language);
+    let default_export_name = extract_default_export_name(root_node, content, &language);
 
     Ok(Module {
         jsdoc,
@@ -77,7 +132,7 @@ pub fn parse_typescript_file(
     })
 }
 
-fn get_jsdoc(node: Option<Node>, content: &str) -> Option<String> {
+fn get_jsdoc<'a>(node: Option<Node<'a>>, content: &'a str) -> Option<String> {
     node.filter(|n| n.kind() == "comment")
         .and_then(|n| n.utf8_text(content.as_bytes()).ok())
         .filter(|comment| comment.starts_with("/**"))
@@ -98,30 +153,55 @@ fn is_module_jsdoc(comment: &str) -> bool {
 ///
 /// # Returns
 ///
-/// A tuple containing:
-/// * A vector of all symbols found in the module
-/// * The name of the default export if one exists, otherwise None
-fn get_module_symbols(
-    root: Node,
-    content: &str,
+/// A vector of all symbols found in the module
+fn get_module_symbols<'a>(
+    node: Node<'a>,
+    content: &'a str,
     language: &Language,
-) -> (Vec<TypeScriptSymbol>, Option<String>) {
-    let (mut symbols, default_export_name) = extract_symbols(root, content, language);
+) -> Vec<TypeScriptSymbol> {
+    let mut symbols = vec![];
 
-    symbols.extend(extract_imports(root, content, language));
-    symbols.extend(extract_namespaces(root, content, language));
+    symbols.extend(extract_imports(node, content, language));
+    symbols.extend(extract_symbols(node, content, language));
+    symbols.extend(extract_namespaces(node, content, language));
+    symbols.extend(extract_exports(node, content, language));
 
-    (symbols, default_export_name)
+    symbols
+}
+
+fn extract_default_export_name<'a>(
+    root: Node<'a>,
+    content: &'a str,
+    language: &Language,
+) -> Option<String> {
+    let query =
+        Query::new(language, DEFAULT_EXPORT_QUERY).expect("Failed to create default export query");
+
+    let name_index = query
+        .capture_index_for_name("name")
+        .expect("Name capture not found");
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, content.as_bytes());
+
+    matches.next().and_then(|match_| {
+        match_
+            .nodes_for_capture_index(name_index)
+            .next()
+            .map(|node| {
+                node.utf8_text(content.as_bytes())
+                    .expect("Failed to get identifier text")
+                    .to_string()
+            })
+    })
 }
 
 fn extract_symbols<'a>(
     root: Node<'a>,
     content: &'a str,
     language: &Language,
-) -> (Vec<TypeScriptSymbol>, Option<String>) {
+) -> Vec<TypeScriptSymbol> {
     let mut symbols = vec![];
-    let mut default_export_name = None;
-    let query = Query::new(language, SYMBOLS_QUERY).expect("Failed to create query");
+    let query = Query::new(language, SYMBOLS_QUERY).expect("Failed to create symbols query");
 
     let name_index = query
         .capture_index_for_name("name")
@@ -133,39 +213,35 @@ fn extract_symbols<'a>(
     let mut cursor = QueryCursor::new();
     let matches = cursor.matches(&query, root, content.as_bytes());
     matches.for_each(|match_| {
-        let name_node = match_.nodes_for_capture_index(name_index).next().unwrap();
+        let name_node = match_
+            .nodes_for_capture_index(name_index)
+            .next()
+            .expect("Missing name node in symbol declaration");
         let mut definition_node = match_
             .nodes_for_capture_index(definition_index)
             .next()
-            .unwrap();
+            .expect("Missing declaration node in symbol declaration");
 
         // Skip symbols that are inside a namespace
         if has_namespace_ancestor(definition_node, root) {
             return;
         }
 
-        let name = name_node.utf8_text(content.as_bytes()).unwrap().to_string();
+        let name = name_node
+            .utf8_text(content.as_bytes())
+            .expect("Failed to get symbol name")
+            .to_string();
 
-        if let Some(parent) = definition_node.parent() {
-            if parent.kind() == "ambient_declaration" {
-                definition_node = parent;
-            }
+        let parent = definition_node.parent().expect("Symbol declaration has no parent");
+        if parent.kind() == "ambient_declaration" {
+            definition_node = parent;
         }
 
         let mut is_exported = false;
-        if let Some(parent) = definition_node.parent() {
-            if parent.kind() == "export_statement" {
-                definition_node = parent;
-                is_exported = true;
-
-                let mut cursor = definition_node.walk();
-                if definition_node
-                    .children(&mut cursor)
-                    .any(|child| child.kind() == "default")
-                {
-                    default_export_name = Some(name.clone());
-                }
-            }
+        let parent = definition_node.parent().expect("Symbol declaration has no parent");
+        if parent.kind() == "export_statement" {
+            definition_node = parent;
+            is_exported = true;
         }
 
         // Get the full source code including any preceding JSDoc comment.
@@ -189,20 +265,17 @@ fn extract_symbols<'a>(
         });
     });
 
-    (symbols, default_export_name)
+    symbols
 }
 
 fn has_namespace_ancestor(node: Node, root: Node) -> bool {
-    if let Some(parent) = node.parent() {
-        if parent.id() == root.id() {
-            false
-        } else if parent.kind() == "internal_module" {
-            true
-        } else {
-            has_namespace_ancestor(parent, root)
-        }
-    } else {
+    let parent = node.parent().expect("Node must have a parent");
+    if parent.id() == root.id() {
         false
+    } else if parent.kind() == "internal_module" {
+        true
+    } else {
+        has_namespace_ancestor(parent, root)
     }
 }
 
@@ -212,7 +285,7 @@ fn extract_imports<'a>(
     language: &Language,
 ) -> Vec<TypeScriptSymbol> {
     let mut imports = vec![];
-    let query = Query::new(language, IMPORT_QUERY).expect("Failed to create query");
+    let query = Query::new(language, IMPORT_QUERY).expect("Failed to create import query");
 
     let target_index = query
         .capture_index_for_name("target")
@@ -224,13 +297,19 @@ fn extract_imports<'a>(
     let mut cursor = QueryCursor::new();
     let matches = cursor.matches(&query, root, content.as_bytes());
     matches.for_each(|match_| {
-        let source_node = match_.nodes_for_capture_index(source_index).next().unwrap();
+        let source_node = match_
+            .nodes_for_capture_index(source_index)
+            .next()
+            .expect("Missing source node in import");
         let source_module = source_node
             .utf8_text(content.as_bytes())
-            .unwrap()
+            .expect("Failed to get import source module")
             .to_string();
 
-        let target_node = match_.nodes_for_capture_index(target_index).next().unwrap();
+        let target_node = match_
+            .nodes_for_capture_index(target_index)
+            .next()
+            .expect("Missing target node in import");
         let mut target_cursor = target_node.walk();
         let subtarget_nodes = target_node.children(&mut target_cursor);
 
@@ -238,7 +317,8 @@ fn extract_imports<'a>(
             "identifier" => Some(TypeScriptSymbol::ModuleImport {
                 source_module: source_module.clone(),
                 target: ImportTarget::Default {
-                    name: extract_identifier_text(child, content).unwrap(),
+                    name: extract_identifier_text(child, content)
+                        .expect("Failed to get import identifier"),
                 },
             }),
             "namespace_import" => {
@@ -246,7 +326,7 @@ fn extract_imports<'a>(
                 let name = child
                     .children(&mut namespace_cursor)
                     .find_map(|n| extract_identifier_text(n, content))
-                    .unwrap();
+                    .expect("Failed to get import identifier");
                 Some(TypeScriptSymbol::ModuleImport {
                     source_module: source_module.clone(),
                     target: ImportTarget::Namespace { name },
@@ -267,7 +347,7 @@ fn extract_imports<'a>(
                     let name = children
                         .next()
                         .and_then(|n| extract_identifier_text(n, content))
-                        .unwrap();
+                        .expect("Failed to get import identifier");
                     names.push(name.clone());
 
                     if let Some(alias) = children.find_map(|n| extract_identifier_text(n, content))
@@ -326,32 +406,36 @@ fn extract_namespaces<'a>(
     let mut cursor = QueryCursor::new();
     let matches = cursor.matches(&query, root, content.as_bytes());
     matches.for_each(|match_| {
-        let name_node = match_.nodes_for_capture_index(name_index).next().unwrap();
-        let namespace_node = name_node.parent().unwrap();
+        let name_node = match_
+            .nodes_for_capture_index(name_index)
+            .next()
+            .expect("Missing name node in namespace");
+        let namespace_node = name_node.parent().expect("Namespace node has no parent");
 
         if has_namespace_ancestor(namespace_node, root) {
             return;
         }
 
-        let name = name_node.utf8_text(content.as_bytes()).unwrap().to_string();
+        let name = name_node
+            .utf8_text(content.as_bytes())
+            .expect("Failed to get namespace name")
+            .to_string();
 
-        let body_node = match_.nodes_for_capture_index(body_index).next().unwrap();
-        let (inner_content, _) = get_module_symbols(body_node, content, language);
-
+        let body_node = match_
+            .nodes_for_capture_index(body_index)
+            .next()
+            .expect("Missing body node in namespace");
+        let inner_content = get_module_symbols(body_node, content, language);
         let mut is_exported = false;
         let mut current_node = namespace_node;
-        if let Some(parent) = current_node.parent() {
-            if parent.kind() == "export_statement" {
-                is_exported = true;
-                current_node = parent;
-            }
+        let parent = current_node.parent().expect("Namespace node has no parent");
+        if parent.kind() == "export_statement" {
+            is_exported = true;
+            current_node = parent;
         }
 
-        let jsdoc = if let Some(expression_statement) = current_node.parent() {
-            get_jsdoc(expression_statement.prev_sibling(), content)
-        } else {
-            None
-        };
+        let expression_statement = current_node.parent().expect("Namespace node has no parent");
+        let jsdoc = get_jsdoc(expression_statement.prev_sibling(), content);
 
         namespaces.push(TypeScriptSymbol::Namespace {
             name,
@@ -362,6 +446,135 @@ fn extract_namespaces<'a>(
     });
 
     namespaces
+}
+
+fn extract_exports<'a>(
+    root: Node<'a>,
+    content: &'a str,
+    language: &Language,
+) -> Vec<TypeScriptSymbol> {
+    let mut exports = vec![];
+    let query = Query::new(language, EXPORTS_QUERY).expect("Failed to create exports query");
+
+    let name_index = query
+        .capture_index_for_name("name")
+        .expect("Name capture not found");
+    let alias_index = query.capture_index_for_name("alias").unwrap();
+    let source_index = query.capture_index_for_name("source").unwrap();
+    let barrel_export_index = query.capture_index_for_name("barrel_export").unwrap();
+
+    let mut cursor = QueryCursor::new();
+    let matches = cursor.matches(&query, root, content.as_bytes());
+
+    let mut current_names = vec![];
+    let mut current_aliases = HashMap::new();
+    let mut current_source = None;
+
+    matches.for_each(|match_| {
+        let source_module = match_
+            .nodes_for_capture_index(source_index)
+            .next()
+            .map(|n| {
+                n.utf8_text(content.as_bytes())
+                    .expect("Failed to get export source module")
+                    .to_string()
+            });
+
+        if match_
+            .nodes_for_capture_index(barrel_export_index)
+            .next()
+            .is_some()
+        {
+            exports.push(TypeScriptSymbol::ModuleExport {
+                source_module,
+                target: ExportTarget::Barrel,
+            });
+            return;
+        }
+
+        let name_node = match_
+            .nodes_for_capture_index(name_index)
+            .next()
+            .expect("Missing name node in export");
+        let name = name_node
+            .utf8_text(content.as_bytes())
+            .expect("Failed to get export name")
+            .to_string();
+        let export_node = name_node.parent().expect("Export node has no parent");
+
+        if export_node.kind() == "namespace_export" {
+            exports.push(TypeScriptSymbol::ModuleExport {
+                source_module,
+                target: ExportTarget::Namespace { name },
+            });
+            return;
+        }
+
+        // Handle source module changes
+        if source_module != current_source {
+            emit_accumulated_exports(
+                &mut exports,
+                &mut current_names,
+                &mut current_aliases,
+                &current_source,
+            );
+            current_source = source_module;
+        }
+
+        // Accumulate the current export
+        current_names.push(name.clone());
+
+        if let Some(alias_node) = match_.nodes_for_capture_index(alias_index).next() {
+            let alias = alias_node
+                .utf8_text(content.as_bytes())
+                .expect("Failed to get export alias")
+                .to_string();
+            current_aliases.insert(name.clone(), alias.clone());
+        }
+
+        // Handle CommonJS exports (export = myFunction)
+        if export_node.kind() == "export_statement" {
+            emit_accumulated_exports(
+                &mut exports,
+                &mut current_names,
+                &mut current_aliases,
+                &current_source,
+            );
+            current_source = None;
+            return;
+        }
+
+        // If this is the last export specifier in the statement, emit it
+        let is_last_specifier = export_node.next_named_sibling().is_none();
+        if is_last_specifier {
+            emit_accumulated_exports(
+                &mut exports,
+                &mut current_names,
+                &mut current_aliases,
+                &current_source,
+            );
+            current_source = None;
+        }
+    });
+
+    exports
+}
+
+fn emit_accumulated_exports(
+    exports: &mut Vec<TypeScriptSymbol>,
+    current_names: &mut Vec<String>,
+    current_aliases: &mut HashMap<String, String>,
+    current_source: &Option<String>,
+) {
+    if !current_names.is_empty() {
+        exports.push(TypeScriptSymbol::ModuleExport {
+            source_module: current_source.clone(),
+            target: ExportTarget::Named {
+                names: std::mem::take(current_names),
+                aliases: std::mem::take(current_aliases),
+            },
+        });
+    }
 }
 
 #[cfg(test)]
@@ -602,20 +815,6 @@ mod tests {
             let symbol = &module.symbols[0];
             assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: false } if symbol.source_code == "declare const VERSION: string;".to_string());
         }
-    }
-
-    mod symbol_exports {
-        use super::*;
-
-        #[test]
-        fn exported_afterwards() {
-            let mut parser = make_parser();
-            let content = "declare const VERSION: string;\nexport { VERSION };";
-
-            let result = parse_typescript_file(content, &mut parser);
-
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "VERSION" && symbol.source_code.contains("declare const VERSION: string")));
-        }
 
         #[test]
         fn export_and_declaration() {
@@ -639,28 +838,6 @@ mod tests {
             assert_matches!(&module, Module { symbols, default_export_name: Some(n), .. } if symbols.len() == 1 && n == "greet");
             let symbol = &module.symbols[0];
             assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "greet" && symbol.source_code == content);
-        }
-
-        #[test]
-        fn default_export_afterwards() {
-            let mut parser = make_parser();
-            let content = "declare const VERSION: string;\nexport default VERSION;";
-
-            let module = parse_typescript_file(content, &mut parser).unwrap();
-
-            assert_matches!(&module, Module { symbols, default_export_name: Some(n), .. } if symbols.len() == 1 && n == "VERSION");
-            let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "VERSION" && symbol.source_code.contains("declare const VERSION: string"));
-        }
-
-        #[test]
-        fn commonjs_export() {
-            let mut parser = make_parser();
-            let content = "declare function myFunction(): void;\nexport = myFunction;";
-
-            let result = parse_typescript_file(content, &mut parser);
-
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "myFunction" && symbol.source_code.contains("declare function myFunction(): void")));
         }
     }
 
@@ -739,12 +916,12 @@ mod tests {
             assert_matches!(outer_namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Foo");
             let inner_namespace = match &outer_namespace {
                 TypeScriptSymbol::Namespace { content, .. } if content.len() == 1 => &content[0],
-                _ => panic!("Expected namespace"),
+                _ => unreachable!("Expected namespace"),
             };
             assert_matches!(inner_namespace, TypeScriptSymbol::Namespace { name, .. } if name == "Bar");
             let symbol = match &inner_namespace {
                 TypeScriptSymbol::Namespace { content, .. } if content.len() == 1 => &content[0],
-                _ => panic!("Expected symbol"),
+                _ => unreachable!("Expected symbol"),
             };
             assert_matches!(symbol, TypeScriptSymbol::Symbol { symbol, is_exported: true } if symbol.name == "VERSION");
         }
@@ -776,7 +953,7 @@ mod tests {
         }
     }
 
-    mod module_imports {
+    mod imports {
         use super::*;
 
         #[test]
@@ -786,7 +963,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleImport { source_module, target } if source_module == "./foo.js" && matches!(target, ImportTarget::Default { name } if name == "foo")));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleImport { source_module, target, .. } if source_module == "./foo.js" && matches!(target, ImportTarget::Default { name } if name == "foo")));
         }
 
         #[test]
@@ -796,7 +973,7 @@ mod tests {
 
             let result = parse_typescript_file(content, &mut parser);
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleImport { source_module, target } if source_module == "./foo.js" && matches!(target, ImportTarget::Namespace { name } if name == "foo")));
+            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleImport { source_module, target, .. } if source_module == "./foo.js" && matches!(target, ImportTarget::Namespace { name } if name == "foo")));
         }
 
         #[test]
@@ -857,33 +1034,37 @@ mod tests {
         }
     }
 
-    mod module_exports {
-        use crate::api::module::ExportTarget;
-
+    mod exports {
         use super::*;
 
         #[test]
-        fn namespace_export() {
+        fn namespace_export_from_another_module() {
             let mut parser = make_parser();
             let content = "export * as foo from './foo.js';";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleExport { source_module, target } if source_module == "./foo.js" && matches!(target, ExportTarget::Namespace { name } if name == "foo")));
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let symbol = &module.symbols[0];
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Namespace { name } if name == "foo"));
         }
 
         #[test]
-        fn named_export() {
+        fn named_export_from_another_module() {
             let mut parser = make_parser();
-            let content = "export { foo } from './foo.js';";
+            let content = "export { foo, bar } from './foo.js';";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleExport { source_module, target } if source_module == "./foo.js" && matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases.is_empty())));
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let symbol = &module.symbols[0];
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases.is_empty()));
         }
 
         #[test]
-        fn named_with_alias() {
+        fn aliased_export_from_another_module() {
             let mut parser = make_parser();
             let content = "export { foo as bar } from './foo.js';";
 
@@ -891,18 +1072,98 @@ mod tests {
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
-            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module, .. } if source_module == "./foo.js");
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
             assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases == &HashMap::from([("foo".to_string(), "bar".to_string())])));
         }
 
         #[test]
-        fn barrel_export() {
+        fn barrel_export_from_another_module() {
             let mut parser = make_parser();
             let content = "export * from './foo.js';";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let module = parse_typescript_file(content, &mut parser).unwrap();
 
-            assert_matches!(result, Ok(Module { symbols: s, .. }) if s.len() == 1 && matches!(&s[0], TypeScriptSymbol::ModuleExport { source_module, target } if source_module == "./foo.js" && matches!(target, ExportTarget::Barrel)));
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let symbol = &module.symbols[0];
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Barrel));
+        }
+
+        #[test]
+        fn symbol_export() {
+            let mut parser = make_parser();
+            let content = "\nexport { VERSION };";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let symbol = &module.symbols[0];
+            assert_matches!(
+                symbol,
+                TypeScriptSymbol::ModuleExport {
+                    source_module: None,
+                    ..
+                }
+            );
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["VERSION".to_string()] && aliases.is_empty()));
+        }
+
+        #[test]
+        fn commonjs_export() {
+            let mut parser = make_parser();
+            let content = "export = myFunction;";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let symbol = &module.symbols[0];
+            assert_matches!(
+                symbol,
+                TypeScriptSymbol::ModuleExport {
+                    source_module: None,
+                    ..
+                }
+            );
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["myFunction".to_string()] && aliases.is_empty()));
+        }
+
+        #[test]
+        fn default_export() {
+            let mut parser = make_parser();
+            let content = "export default VERSION;";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_matches!(&module, Module { default_export_name: Some(n), .. } if n == "VERSION");
+        }
+
+        #[test]
+        fn mixed_export_from_another_module() {
+            let mut parser = make_parser();
+            let content = "export { foo, bar as baz } from './module.js';";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
+            let symbol = &module.symbols[0];
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./module.js");
+            assert_matches!(symbol, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string(), "bar".to_string()] && aliases == &HashMap::from([("bar".to_string(), "baz".to_string())])));
+        }
+
+        #[test]
+        fn exports_from_multiple_modules() {
+            let mut parser = make_parser();
+            let content = "export { foo } from './foo.js';\nexport { bar } from './bar.js';";
+
+            let module = parse_typescript_file(content, &mut parser).unwrap();
+
+            assert_matches!(&module, Module { symbols, .. } if symbols.len() == 2);
+            let first_export = &module.symbols[0];
+            assert_matches!(first_export, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./foo.js");
+            assert_matches!(first_export, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["foo".to_string()] && aliases.is_empty()));
+            let second_export = &module.symbols[1];
+            assert_matches!(second_export, TypeScriptSymbol::ModuleExport { source_module: Some(s), .. } if s == "./bar.js");
+            assert_matches!(second_export, TypeScriptSymbol::ModuleExport { target, .. } if matches!(target, ExportTarget::Named { names, aliases } if *names == vec!["bar".to_string()] && aliases.is_empty()));
         }
     }
 }
