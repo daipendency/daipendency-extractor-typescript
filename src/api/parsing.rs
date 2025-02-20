@@ -1,7 +1,7 @@
-use daipendency_extractor::{ExtractionError, Symbol};
+use daipendency_extractor::{ExtractionError, ParsedFile, Symbol};
 use std::collections::HashMap;
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{Language, Node, Parser, Query, QueryCursor};
+use tree_sitter::{Node, Parser, QueryCursor};
 
 use crate::api::module::{ExportTarget, ImportTarget, Module, TypeScriptSymbol};
 
@@ -107,23 +107,12 @@ pub fn parse_typescript_file(
     content: &str,
     parser: &mut Parser,
 ) -> Result<Module, ExtractionError> {
-    let tree = parser
-        .parse(content, None)
-        .ok_or_else(|| ExtractionError::Malformed("Failed to parse source file".to_string()))?;
-    let root_node = tree.root_node();
+    let parsed_file = ParsedFile::parse(content, parser)?;
+    let root_node = parsed_file.root_node();
 
-    if root_node.has_error() {
-        return Err(ExtractionError::Malformed(
-            "Failed to parse source file".to_string(),
-        ));
-    }
-
-    let jsdoc = get_jsdoc(root_node.child(0), content).filter(|s| is_module_jsdoc(s.as_str()));
-    let language = parser
-        .language()
-        .expect("Failed to get language from parser");
-    let symbols = get_module_symbols(root_node, content, &language);
-    let default_export_name = extract_default_export_name(root_node, content, &language);
+    let jsdoc = get_jsdoc(root_node.child(0), &parsed_file).filter(|s| is_module_jsdoc(s.as_str()));
+    let symbols = get_module_symbols(root_node, &parsed_file)?;
+    let default_export_name = extract_default_export_name(root_node, &parsed_file)?;
 
     Ok(Module {
         jsdoc,
@@ -132,11 +121,10 @@ pub fn parse_typescript_file(
     })
 }
 
-fn get_jsdoc<'a>(node: Option<Node<'a>>, content: &'a str) -> Option<String> {
+fn get_jsdoc<'a>(node: Option<Node<'a>>, parsed_file: &'a ParsedFile) -> Option<String> {
     node.filter(|n| n.kind() == "comment")
-        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+        .and_then(|n| parsed_file.render_node(n).ok())
         .filter(|comment| comment.starts_with("/**"))
-        .map(|comment| comment.to_string())
 }
 
 fn is_module_jsdoc(comment: &str) -> bool {
@@ -148,60 +136,51 @@ fn is_module_jsdoc(comment: &str) -> bool {
 /// # Arguments
 ///
 /// * `node` - The root node of the TypeScript AST
-/// * `content` - The source code content as a string
-/// * `language` - The language of the TypeScript AST
+/// * `parsed_file` - The parsed file containing the source code
 ///
 /// # Returns
 ///
 /// A vector of all symbols found in the module
 fn get_module_symbols<'a>(
     node: Node<'a>,
-    content: &'a str,
-    language: &Language,
-) -> Vec<TypeScriptSymbol> {
+    parsed_file: &'a ParsedFile,
+) -> Result<Vec<TypeScriptSymbol>, ExtractionError> {
     let mut symbols = vec![];
 
-    symbols.extend(extract_imports(node, content, language));
-    symbols.extend(extract_symbols(node, content, language));
-    symbols.extend(extract_namespaces(node, content, language));
-    symbols.extend(extract_exports(node, content, language));
+    symbols.extend(extract_imports(node, parsed_file)?);
+    symbols.extend(extract_symbols(node, parsed_file)?);
+    symbols.extend(extract_namespaces(node, parsed_file)?);
+    symbols.extend(extract_exports(node, parsed_file)?);
 
-    symbols
+    Ok(symbols)
 }
 
 fn extract_default_export_name<'a>(
     root: Node<'a>,
-    content: &'a str,
-    language: &Language,
-) -> Option<String> {
-    let query =
-        Query::new(language, DEFAULT_EXPORT_QUERY).expect("Failed to create default export query");
+    parsed_file: &'a ParsedFile,
+) -> Result<Option<String>, ExtractionError> {
+    let query = parsed_file.make_query(DEFAULT_EXPORT_QUERY)?;
 
     let name_index = query
         .capture_index_for_name("name")
         .expect("Name capture not found");
     let mut cursor = QueryCursor::new();
-    let mut matches = cursor.matches(&query, root, content.as_bytes());
+    let mut matches = parsed_file.exec_query(&query, root, &mut cursor);
 
-    matches.next().and_then(|match_| {
+    Ok(matches.next().and_then(|match_| {
         match_
             .nodes_for_capture_index(name_index)
             .next()
-            .map(|node| {
-                node.utf8_text(content.as_bytes())
-                    .expect("Failed to get identifier text")
-                    .to_string()
-            })
-    })
+            .and_then(|node| parsed_file.render_node(node).ok())
+    }))
 }
 
 fn extract_symbols<'a>(
     root: Node<'a>,
-    content: &'a str,
-    language: &Language,
-) -> Vec<TypeScriptSymbol> {
+    parsed_file: &'a ParsedFile,
+) -> Result<Vec<TypeScriptSymbol>, ExtractionError> {
     let mut symbols = vec![];
-    let query = Query::new(language, SYMBOLS_QUERY).expect("Failed to create symbols query");
+    let query = parsed_file.make_query(SYMBOLS_QUERY)?;
 
     let name_index = query
         .capture_index_for_name("name")
@@ -211,8 +190,9 @@ fn extract_symbols<'a>(
         .expect("Declaration capture not found");
 
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, root, content.as_bytes());
-    matches.for_each(|match_| {
+    let mut matches = parsed_file.exec_query(&query, root, &mut cursor);
+
+    while let Some(match_) = matches.next() {
         let name_node = match_
             .nodes_for_capture_index(name_index)
             .next()
@@ -224,13 +204,10 @@ fn extract_symbols<'a>(
 
         // Skip symbols that are inside a namespace
         if has_namespace_ancestor(definition_node, root) {
-            return;
+            continue;
         }
 
-        let name = name_node
-            .utf8_text(content.as_bytes())
-            .expect("Failed to get symbol name")
-            .to_string();
+        let name = parsed_file.render_node(name_node)?;
 
         let parent = definition_node
             .parent()
@@ -252,14 +229,14 @@ fn extract_symbols<'a>(
         let mut start_byte = definition_node.start_byte();
         let end_byte = definition_node.end_byte();
         if let Some(previous_node) = definition_node.prev_sibling() {
-            if let Some(jsdoc) = get_jsdoc(Some(previous_node), content) {
+            if let Some(jsdoc) = get_jsdoc(Some(previous_node), parsed_file) {
                 if !is_module_jsdoc(&jsdoc) {
                     start_byte = previous_node.start_byte();
                 }
             }
         }
 
-        let source_code = content[start_byte..end_byte].to_string();
+        let source_code = parsed_file.render(start_byte..end_byte);
 
         let symbol = Symbol { name, source_code };
 
@@ -267,13 +244,13 @@ fn extract_symbols<'a>(
             symbol,
             is_exported,
         });
-    });
+    }
 
-    symbols
+    Ok(symbols)
 }
 
 fn has_namespace_ancestor(node: Node, root: Node) -> bool {
-    let parent = node.parent().expect("Node must have a parent");
+    let parent = node.parent().expect("Node has no parent");
     if parent.id() == root.id() {
         false
     } else if parent.kind() == "internal_module" {
@@ -285,11 +262,10 @@ fn has_namespace_ancestor(node: Node, root: Node) -> bool {
 
 fn extract_imports<'a>(
     root: Node<'a>,
-    content: &'a str,
-    language: &Language,
-) -> Vec<TypeScriptSymbol> {
+    parsed_file: &'a ParsedFile,
+) -> Result<Vec<TypeScriptSymbol>, ExtractionError> {
     let mut imports = vec![];
-    let query = Query::new(language, IMPORT_QUERY).expect("Failed to create import query");
+    let query = parsed_file.make_query(IMPORT_QUERY)?;
 
     let target_index = query
         .capture_index_for_name("target")
@@ -299,16 +275,14 @@ fn extract_imports<'a>(
         .expect("Source capture not found");
 
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, root, content.as_bytes());
-    matches.for_each(|match_| {
+    let mut matches = parsed_file.exec_query(&query, root, &mut cursor);
+
+    while let Some(match_) = matches.next() {
         let source_node = match_
             .nodes_for_capture_index(source_index)
             .next()
             .expect("Missing source node in import");
-        let source_module = source_node
-            .utf8_text(content.as_bytes())
-            .expect("Failed to get import source module")
-            .to_string();
+        let source_module = parsed_file.render_node(source_node)?;
 
         let target_node = match_
             .nodes_for_capture_index(target_index)
@@ -321,7 +295,7 @@ fn extract_imports<'a>(
             "identifier" => Some(TypeScriptSymbol::ModuleImport {
                 source_module: source_module.clone(),
                 target: ImportTarget::Default {
-                    name: extract_identifier_text(child, content)
+                    name: extract_identifier_text(child, parsed_file)
                         .expect("Failed to get import identifier"),
                 },
             }),
@@ -329,7 +303,7 @@ fn extract_imports<'a>(
                 let mut namespace_cursor = child.walk();
                 let name = child
                     .children(&mut namespace_cursor)
-                    .find_map(|n| extract_identifier_text(n, content))
+                    .find_map(|n| extract_identifier_text(n, parsed_file))
                     .expect("Failed to get import identifier");
                 Some(TypeScriptSymbol::ModuleImport {
                     source_module: source_module.clone(),
@@ -350,11 +324,12 @@ fn extract_imports<'a>(
 
                     let name = children
                         .next()
-                        .and_then(|n| extract_identifier_text(n, content))
+                        .and_then(|n| extract_identifier_text(n, parsed_file))
                         .expect("Failed to get import identifier");
                     names.push(name.clone());
 
-                    if let Some(alias) = children.find_map(|n| extract_identifier_text(n, content))
+                    if let Some(alias) =
+                        children.find_map(|n| extract_identifier_text(n, parsed_file))
                     {
                         aliases.insert(name, alias);
                     }
@@ -369,16 +344,14 @@ fn extract_imports<'a>(
         });
 
         imports.extend(targets);
-    });
+    }
 
-    imports
+    Ok(imports)
 }
 
-fn extract_identifier_text(node: Node, content: &str) -> Option<String> {
+fn extract_identifier_text(node: Node, parsed_file: &ParsedFile) -> Option<String> {
     if node.kind() == "identifier" {
-        node.utf8_text(content.as_bytes())
-            .ok()
-            .map(|s| s.to_string())
+        parsed_file.render_node(node).ok()
     } else {
         None
     }
@@ -386,19 +359,16 @@ fn extract_identifier_text(node: Node, content: &str) -> Option<String> {
 
 fn extract_namespaces<'a>(
     root: Node<'a>,
-    content: &'a str,
-    language: &Language,
-) -> Vec<TypeScriptSymbol> {
+    parsed_file: &'a ParsedFile,
+) -> Result<Vec<TypeScriptSymbol>, ExtractionError> {
     let mut namespaces = vec![];
-    let query = Query::new(
-        language,
+    let query = parsed_file.make_query(
         r#"
         (internal_module
             name: (identifier) @name
             body: (statement_block) @body)
     "#,
-    )
-    .expect("Failed to create query");
+    )?;
 
     let name_index = query
         .capture_index_for_name("name")
@@ -408,8 +378,9 @@ fn extract_namespaces<'a>(
         .expect("Body capture not found");
 
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, root, content.as_bytes());
-    matches.for_each(|match_| {
+    let mut matches = parsed_file.exec_query(&query, root, &mut cursor);
+
+    while let Some(match_) = matches.next() {
         let name_node = match_
             .nodes_for_capture_index(name_index)
             .next()
@@ -417,19 +388,16 @@ fn extract_namespaces<'a>(
         let namespace_node = name_node.parent().expect("Namespace node has no parent");
 
         if has_namespace_ancestor(namespace_node, root) {
-            return;
+            continue;
         }
 
-        let name = name_node
-            .utf8_text(content.as_bytes())
-            .expect("Failed to get namespace name")
-            .to_string();
-
+        let name = parsed_file.render_node(name_node)?;
         let body_node = match_
             .nodes_for_capture_index(body_index)
             .next()
             .expect("Missing body node in namespace");
-        let inner_content = get_module_symbols(body_node, content, language);
+
+        let inner_content = get_module_symbols(body_node, parsed_file)?;
         let mut is_exported = false;
         let mut current_node = namespace_node;
         let parent = current_node.parent().expect("Namespace node has no parent");
@@ -439,7 +407,7 @@ fn extract_namespaces<'a>(
         }
 
         let expression_statement = current_node.parent().expect("Namespace node has no parent");
-        let jsdoc = get_jsdoc(expression_statement.prev_sibling(), content);
+        let jsdoc = get_jsdoc(expression_statement.prev_sibling(), parsed_file);
 
         namespaces.push(TypeScriptSymbol::Namespace {
             name,
@@ -447,18 +415,17 @@ fn extract_namespaces<'a>(
             is_exported,
             jsdoc,
         });
-    });
+    }
 
-    namespaces
+    Ok(namespaces)
 }
 
 fn extract_exports<'a>(
     root: Node<'a>,
-    content: &'a str,
-    language: &Language,
-) -> Vec<TypeScriptSymbol> {
+    parsed_file: &'a ParsedFile,
+) -> Result<Vec<TypeScriptSymbol>, ExtractionError> {
     let mut exports = vec![];
-    let query = Query::new(language, EXPORTS_QUERY).expect("Failed to create exports query");
+    let query = parsed_file.make_query(EXPORTS_QUERY)?;
 
     let name_index = query
         .capture_index_for_name("name")
@@ -468,21 +435,17 @@ fn extract_exports<'a>(
     let barrel_export_index = query.capture_index_for_name("barrel_export").unwrap();
 
     let mut cursor = QueryCursor::new();
-    let matches = cursor.matches(&query, root, content.as_bytes());
+    let mut matches = parsed_file.exec_query(&query, root, &mut cursor);
 
     let mut current_names = vec![];
     let mut current_aliases = HashMap::new();
     let mut current_source = None;
 
-    matches.for_each(|match_| {
+    while let Some(match_) = matches.next() {
         let source_module = match_
             .nodes_for_capture_index(source_index)
             .next()
-            .map(|n| {
-                n.utf8_text(content.as_bytes())
-                    .expect("Failed to get export source module")
-                    .to_string()
-            });
+            .and_then(|n| parsed_file.render_node(n).ok());
 
         if match_
             .nodes_for_capture_index(barrel_export_index)
@@ -493,17 +456,14 @@ fn extract_exports<'a>(
                 source_module,
                 target: ExportTarget::Barrel,
             });
-            return;
+            continue;
         }
 
         let name_node = match_
             .nodes_for_capture_index(name_index)
             .next()
             .expect("Missing name node in export");
-        let name = name_node
-            .utf8_text(content.as_bytes())
-            .expect("Failed to get export name")
-            .to_string();
+        let name = parsed_file.render_node(name_node)?;
         let export_node = name_node.parent().expect("Export node has no parent");
 
         if export_node.kind() == "namespace_export" {
@@ -511,7 +471,7 @@ fn extract_exports<'a>(
                 source_module,
                 target: ExportTarget::Namespace { name },
             });
-            return;
+            continue;
         }
 
         // Handle source module changes
@@ -529,10 +489,7 @@ fn extract_exports<'a>(
         current_names.push(name.clone());
 
         if let Some(alias_node) = match_.nodes_for_capture_index(alias_index).next() {
-            let alias = alias_node
-                .utf8_text(content.as_bytes())
-                .expect("Failed to get export alias")
-                .to_string();
+            let alias = parsed_file.render_node(alias_node)?;
             current_aliases.insert(name.clone(), alias.clone());
         }
 
@@ -545,7 +502,7 @@ fn extract_exports<'a>(
                 &current_source,
             );
             current_source = None;
-            return;
+            continue;
         }
 
         // If this is the last export specifier in the statement, emit it
@@ -559,9 +516,9 @@ fn extract_exports<'a>(
             );
             current_source = None;
         }
-    });
+    }
 
-    exports
+    Ok(exports)
 }
 
 fn emit_accumulated_exports(
