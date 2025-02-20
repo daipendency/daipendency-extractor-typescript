@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{dependencies, metadata};
+use crate::{api, dependencies, metadata};
 use daipendency_extractor::{
     DependencyResolutionError, ExtractionError, Extractor, LibraryMetadata, LibraryMetadataError,
     Namespace,
@@ -26,7 +26,7 @@ impl Extractor for TypeScriptExtractor {
         library_metadata: &LibraryMetadata,
         parser: &mut Parser,
     ) -> Result<Vec<Namespace>, ExtractionError> {
-        todo!()
+        api::extract_public_api(library_metadata, parser)
     }
 
     fn resolve_dependency_path(
