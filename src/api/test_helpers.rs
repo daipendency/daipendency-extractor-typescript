@@ -52,7 +52,6 @@ pub fn deconstruct_module_export(symbol: &TypeScriptSymbol) -> (Option<String>, 
     }
 }
 
-#[cfg(test)]
 mod tests {
     use super::*;
 

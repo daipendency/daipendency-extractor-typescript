@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct TSEntryPoint {
-    /// Path to the TypeScript declaration file specified in the `types` field of `package.json`.
+    /// Path to the TypeScript declaration file specified in the `types` or `typings` field of `package.json`.
     pub types_path: PathBuf,
 }
 
@@ -15,7 +15,10 @@ pub type TSLibraryMetadata = LibraryMetadata<TSEntryPoint>;
 struct PackageJson {
     name: String,
     version: String,
-    types: String,
+    #[serde(default)]
+    types: Option<String>,
+    #[serde(default)]
+    typings: Option<String>,
 }
 
 pub fn extract_metadata(path: &Path) -> Result<TSLibraryMetadata, LibraryMetadataError> {
@@ -23,18 +26,18 @@ pub fn extract_metadata(path: &Path) -> Result<TSLibraryMetadata, LibraryMetadat
     let content = std::fs::read_to_string(&package_json_path)
         .map_err(LibraryMetadataError::MissingManifest)?;
 
-    let package: PackageJson = serde_json::from_str(&content)
+    let package_json: PackageJson = serde_json::from_str(&content)
         .map_err(|e| LibraryMetadataError::MalformedManifest(e.to_string()))?;
+
+    let entry_point = get_entry_point(&package_json, path)?;
 
     let documentation = read_readme(path);
 
     Ok(TSLibraryMetadata {
-        name: package.name,
-        version: Some(package.version),
+        name: package_json.name,
+        version: Some(package_json.version),
         documentation,
-        entry_point: TSEntryPoint {
-            types_path: path.join(package.types),
-        },
+        entry_point,
     })
 }
 
@@ -46,6 +49,25 @@ fn read_readme(path: &Path) -> String {
         }
     }
     String::new()
+}
+
+fn get_entry_point(
+    package_json: &PackageJson,
+    path: &Path,
+) -> Result<TSEntryPoint, LibraryMetadataError> {
+    let types_path = package_json
+        .types
+        .as_ref()
+        .or(package_json.typings.as_ref())
+        .ok_or_else(|| {
+            LibraryMetadataError::MalformedManifest(
+                "neither 'types' nor 'typings' field specified".to_string(),
+            )
+        })?;
+    let entry_point = TSEntryPoint {
+        types_path: path.join(types_path),
+    };
+    Ok(entry_point)
 }
 
 #[cfg(test)]
@@ -112,7 +134,7 @@ mod tests {
 
         let result = extract_metadata(&temp_dir.path);
 
-        assert_matches!(result, Err(LibraryMetadataError::MalformedManifest(ref s)) if s.contains("missing field `types`"));
+        assert_matches!(result, Err(LibraryMetadataError::MalformedManifest(ref s)) if s.contains("neither 'types' nor 'typings' field specified"));
     }
 
     #[test]
@@ -125,15 +147,49 @@ mod tests {
             )
             .unwrap();
 
-        let result = extract_metadata(&temp_dir.path);
+        let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-        assert!(result.is_ok());
-        let metadata = result.unwrap();
         assert_eq!(metadata.name, "test-pkg");
         assert_eq!(metadata.version, Some("1.0.0".to_string()));
         assert_eq!(
             metadata.entry_point.types_path,
             temp_dir.path.join("dist/index.d.ts")
+        );
+    }
+
+    #[test]
+    fn valid_manifest_with_typings() {
+        let temp_dir = TempDir::new();
+        temp_dir
+            .create_file(
+                "package.json",
+                r#"{"name": "test-pkg", "version": "1.0.0", "typings": "dist/index.d.ts"}"#,
+            )
+            .unwrap();
+
+        let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+        assert_eq!(
+            metadata.entry_point.types_path,
+            temp_dir.path.join("dist/index.d.ts")
+        );
+    }
+
+    #[test]
+    fn valid_manifest_with_both_types_and_typings() {
+        let temp_dir = TempDir::new();
+        temp_dir
+            .create_file(
+                "package.json",
+                r#"{"name": "test-pkg", "version": "1.0.0", "types": "dist/types.d.ts", "typings": "dist/typings.d.ts"}"#,
+            )
+            .unwrap();
+
+        let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+        assert_eq!(
+            metadata.entry_point.types_path,
+            temp_dir.path.join("dist/types.d.ts")
         );
     }
 
@@ -149,10 +205,9 @@ mod tests {
             let temp_dir = TempDir::new();
             temp_dir.create_file("package.json", PACKAGE_JSON).unwrap();
 
-            let result = extract_metadata(&temp_dir.path);
+            let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-            assert!(result.is_ok());
-            assert_eq!(result.unwrap().documentation, "");
+            assert_eq!(metadata.documentation, "");
         }
 
         #[test]
@@ -161,10 +216,8 @@ mod tests {
             temp_dir.create_file("package.json", PACKAGE_JSON).unwrap();
             temp_dir.create_file("README.md", README_CONTENT).unwrap();
 
-            let result = extract_metadata(&temp_dir.path);
+            let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-            assert!(result.is_ok());
-            let metadata = result.unwrap();
             assert_eq!(metadata.documentation, README_CONTENT);
         }
 
@@ -174,10 +227,8 @@ mod tests {
             temp_dir.create_file("package.json", PACKAGE_JSON).unwrap();
             temp_dir.create_file("README.txt", README_CONTENT).unwrap();
 
-            let result = extract_metadata(&temp_dir.path);
+            let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-            assert!(result.is_ok());
-            let metadata = result.unwrap();
             assert_eq!(metadata.documentation, README_CONTENT);
         }
 
@@ -187,10 +238,8 @@ mod tests {
             temp_dir.create_file("package.json", PACKAGE_JSON).unwrap();
             temp_dir.create_file("README", README_CONTENT).unwrap();
 
-            let result = extract_metadata(&temp_dir.path);
+            let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-            assert!(result.is_ok());
-            let metadata = result.unwrap();
             assert_eq!(metadata.documentation, README_CONTENT);
         }
     }
