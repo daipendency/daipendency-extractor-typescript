@@ -40,9 +40,9 @@ checksum = "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd"
 
 [[package]]
 name = "daipendency-extractor"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d11db66dde6e57e890bffbe3d38ef5d6025a18da7488208d99e4b8ad68d059a0"
+checksum = "1683cdcc65e332cacc016fa7936ef27a1c5e2a6fe17a7bdb93c9ec64fb2b5541"
 dependencies = [
  "cc",
  "thiserror",

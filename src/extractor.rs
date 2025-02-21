@@ -1,29 +1,28 @@
 use std::path::{Path, PathBuf};
 
-use crate::{api, dependencies, metadata};
+use crate::{
+    api, dependencies,
+    metadata::{extract_metadata, TSLibraryMetadata},
+};
 use daipendency_extractor::{
-    DependencyResolutionError, ExtractionError, Extractor, LibraryMetadata, LibraryMetadataError,
-    Namespace,
+    DependencyResolutionError, ExtractionError, Extractor, LibraryMetadataError, Namespace,
 };
 use tree_sitter::{Language, Parser};
 
 pub struct TypeScriptExtractor;
 
-impl Extractor for TypeScriptExtractor {
+impl Extractor<PathBuf> for TypeScriptExtractor {
     fn get_parser_language(&self) -> Language {
         tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }
 
-    fn get_library_metadata(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<LibraryMetadata, LibraryMetadataError> {
-        metadata::extract_metadata(path)
+    fn get_library_metadata(&self, path: &Path) -> Result<TSLibraryMetadata, LibraryMetadataError> {
+        extract_metadata(path)
     }
 
     fn extract_public_api(
         &self,
-        library_metadata: &LibraryMetadata,
+        library_metadata: &TSLibraryMetadata,
         parser: &mut Parser,
     ) -> Result<Vec<Namespace>, ExtractionError> {
         api::extract_public_api(library_metadata, parser)

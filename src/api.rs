@@ -3,11 +3,13 @@ mod parsing;
 #[cfg(test)]
 mod test_helpers;
 
-use daipendency_extractor::{ExtractionError, LibraryMetadata, Namespace, Symbol};
+use daipendency_extractor::{ExtractionError, Namespace, Symbol};
 use tree_sitter::{Node, Parser};
 
+use crate::metadata::TSLibraryMetadata;
+
 pub fn extract_public_api(
-    library_metadata: &LibraryMetadata,
+    library_metadata: &TSLibraryMetadata,
     parser: &mut Parser,
 ) -> Result<Vec<Namespace>, ExtractionError> {
     let source_code =
@@ -111,7 +113,7 @@ mod tests {
     use super::*;
     use daipendency_testing::{debug_node, tempdir::TempDir};
 
-    fn setup_test_dir(content: &str) -> (TempDir, LibraryMetadata) {
+    fn setup_test_dir(content: &str) -> (TempDir, TSLibraryMetadata) {
         let temp_dir = TempDir::new();
         temp_dir
             .create_file(
@@ -121,7 +123,7 @@ mod tests {
             .unwrap();
         temp_dir.create_file("index.d.ts", content).unwrap();
 
-        let library_metadata = LibraryMetadata {
+        let library_metadata = TSLibraryMetadata {
             name: "test-pkg".to_string(),
             version: Some("1.0.0".to_string()),
             documentation: String::new(),

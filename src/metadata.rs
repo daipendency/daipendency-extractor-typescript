@@ -1,6 +1,9 @@
 use daipendency_extractor::{LibraryMetadata, LibraryMetadataError};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// TypeScript library metadata.
+pub type TSLibraryMetadata = LibraryMetadata<PathBuf>;
 
 #[derive(Debug, Deserialize)]
 struct PackageJson {
@@ -9,7 +12,7 @@ struct PackageJson {
     types: String,
 }
 
-pub fn extract_metadata(path: &Path) -> Result<LibraryMetadata, LibraryMetadataError> {
+pub fn extract_metadata(path: &Path) -> Result<TSLibraryMetadata, LibraryMetadataError> {
     let package_json_path = path.join("package.json");
     let content = std::fs::read_to_string(&package_json_path)
         .map_err(LibraryMetadataError::MissingManifest)?;
@@ -19,7 +22,7 @@ pub fn extract_metadata(path: &Path) -> Result<LibraryMetadata, LibraryMetadataE
 
     let documentation = read_readme(path);
 
-    Ok(LibraryMetadata {
+    Ok(TSLibraryMetadata {
         name: package.name,
         version: Some(package.version),
         documentation,
