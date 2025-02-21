@@ -2,8 +2,14 @@ use daipendency_extractor::{LibraryMetadata, LibraryMetadataError};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug)]
+pub struct TSEntryPoint {
+    /// Path to the TypeScript declaration file specified in the `types` field of `package.json`.
+    pub types_path: PathBuf,
+}
+
 /// TypeScript library metadata.
-pub type TSLibraryMetadata = LibraryMetadata<PathBuf>;
+pub type TSLibraryMetadata = LibraryMetadata<TSEntryPoint>;
 
 #[derive(Debug, Deserialize)]
 struct PackageJson {
@@ -26,7 +32,9 @@ pub fn extract_metadata(path: &Path) -> Result<TSLibraryMetadata, LibraryMetadat
         name: package.name,
         version: Some(package.version),
         documentation,
-        entry_point: path.join(package.types),
+        entry_point: TSEntryPoint {
+            types_path: path.join(package.types),
+        },
     })
 }
 
@@ -123,7 +131,10 @@ mod tests {
         let metadata = result.unwrap();
         assert_eq!(metadata.name, "test-pkg");
         assert_eq!(metadata.version, Some("1.0.0".to_string()));
-        assert_eq!(metadata.entry_point, temp_dir.path.join("dist/index.d.ts"));
+        assert_eq!(
+            metadata.entry_point.types_path,
+            temp_dir.path.join("dist/index.d.ts")
+        );
     }
 
     mod readme {

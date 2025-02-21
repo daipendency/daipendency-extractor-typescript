@@ -12,8 +12,8 @@ pub fn extract_public_api(
     library_metadata: &TSLibraryMetadata,
     parser: &mut Parser,
 ) -> Result<Vec<Namespace>, ExtractionError> {
-    let source_code =
-        std::fs::read_to_string(&library_metadata.entry_point).map_err(ExtractionError::Io)?;
+    let source_code = std::fs::read_to_string(&library_metadata.entry_point.types_path)
+        .map_err(ExtractionError::Io)?;
 
     let tree = parser
         .parse(&source_code, None)
@@ -109,6 +109,8 @@ fn get_node_text(node: Node, source_code: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::metadata::TSEntryPoint;
+
     use super::test_helpers::make_parser;
     use super::*;
     use daipendency_testing::{debug_node, tempdir::TempDir};
@@ -127,7 +129,9 @@ mod tests {
             name: "test-pkg".to_string(),
             version: Some("1.0.0".to_string()),
             documentation: String::new(),
-            entry_point: temp_dir.path.join("index.d.ts"),
+            entry_point: TSEntryPoint {
+                types_path: temp_dir.path.join("index.d.ts"),
+            },
         };
 
         (temp_dir, library_metadata)
