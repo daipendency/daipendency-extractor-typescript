@@ -1,12 +1,9 @@
 use daipendency_extractor::{LibraryMetadata, LibraryMetadataError};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
-pub struct TSEntryPoint {
-    /// Path to the TypeScript declaration file specified in the `types` or `typings` field of `package.json`.
-    pub types_path: PathBuf,
-}
+pub type TSEntryPoint = HashMap<String, PathBuf>;
 
 /// TypeScript library metadata.
 pub type TSLibraryMetadata = LibraryMetadata<TSEntryPoint>;
@@ -19,6 +16,15 @@ struct PackageJson {
     types: Option<String>,
     #[serde(default)]
     typings: Option<String>,
+    #[serde(default)]
+    exports: Option<ExportConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ExportConfig {
+    Simple(String),
+    Map(HashMap<String, ExportConfig>),
 }
 
 pub fn extract_metadata(path: &Path) -> Result<TSLibraryMetadata, LibraryMetadataError> {
@@ -29,7 +35,7 @@ pub fn extract_metadata(path: &Path) -> Result<TSLibraryMetadata, LibraryMetadat
     let package_json: PackageJson = serde_json::from_str(&content)
         .map_err(|e| LibraryMetadataError::MalformedManifest(e.to_string()))?;
 
-    let entry_point = get_entry_point(&package_json, path)?;
+    let entry_point = get_entry_point(&package_json, path);
 
     let documentation = read_readme(path);
 
@@ -51,23 +57,36 @@ fn read_readme(path: &Path) -> String {
     String::new()
 }
 
-fn get_entry_point(
-    package_json: &PackageJson,
-    path: &Path,
-) -> Result<TSEntryPoint, LibraryMetadataError> {
-    let types_path = package_json
+fn get_entry_point(package_json: &PackageJson, path: &Path) -> TSEntryPoint {
+    let mut entry_point = HashMap::new();
+
+    // Handle exports
+    if let Some(export_config) = &package_json.exports {
+        match export_config {
+            ExportConfig::Map(export_map) => {
+                for (subpath, config) in export_map {
+                    if let ExportConfig::Map(conditions) = config {
+                        if let Some(ExportConfig::Simple(types_path)) = conditions.get("types") {
+                            entry_point.insert(
+                                subpath.clone(),
+                                path.join(types_path.trim_start_matches("./")),
+                            );
+                        }
+                    }
+                }
+            }
+            ExportConfig::Simple(_) => {}
+        }
+    } else if let Some(types) = package_json
         .types
         .as_ref()
         .or(package_json.typings.as_ref())
-        .ok_or_else(|| {
-            LibraryMetadataError::MalformedManifest(
-                "neither 'types' nor 'typings' field specified".to_string(),
-            )
-        })?;
-    let entry_point = TSEntryPoint {
-        types_path: path.join(types_path),
-    };
-    Ok(entry_point)
+    {
+        // Only use types/typings if there's no exports field
+        entry_point.insert(".".to_string(), path.join(types));
+    }
+
+    entry_point
 }
 
 #[cfg(test)]
@@ -123,21 +142,6 @@ mod tests {
     }
 
     #[test]
-    fn missing_types() {
-        let temp_dir = TempDir::new();
-        temp_dir
-            .create_file(
-                "package.json",
-                r#"{"name": "test-pkg", "version": "1.0.0"}"#,
-            )
-            .unwrap();
-
-        let result = extract_metadata(&temp_dir.path);
-
-        assert_matches!(result, Err(LibraryMetadataError::MalformedManifest(ref s)) if s.contains("neither 'types' nor 'typings' field specified"));
-    }
-
-    #[test]
     fn valid_manifest() {
         let temp_dir = TempDir::new();
         temp_dir
@@ -152,44 +156,8 @@ mod tests {
         assert_eq!(metadata.name, "test-pkg");
         assert_eq!(metadata.version, Some("1.0.0".to_string()));
         assert_eq!(
-            metadata.entry_point.types_path,
-            temp_dir.path.join("dist/index.d.ts")
-        );
-    }
-
-    #[test]
-    fn valid_manifest_with_typings() {
-        let temp_dir = TempDir::new();
-        temp_dir
-            .create_file(
-                "package.json",
-                r#"{"name": "test-pkg", "version": "1.0.0", "typings": "dist/index.d.ts"}"#,
-            )
-            .unwrap();
-
-        let metadata = extract_metadata(&temp_dir.path).unwrap();
-
-        assert_eq!(
-            metadata.entry_point.types_path,
-            temp_dir.path.join("dist/index.d.ts")
-        );
-    }
-
-    #[test]
-    fn valid_manifest_with_both_types_and_typings() {
-        let temp_dir = TempDir::new();
-        temp_dir
-            .create_file(
-                "package.json",
-                r#"{"name": "test-pkg", "version": "1.0.0", "types": "dist/types.d.ts", "typings": "dist/typings.d.ts"}"#,
-            )
-            .unwrap();
-
-        let metadata = extract_metadata(&temp_dir.path).unwrap();
-
-        assert_eq!(
-            metadata.entry_point.types_path,
-            temp_dir.path.join("dist/types.d.ts")
+            metadata.entry_point.get("."),
+            Some(&temp_dir.path.join("dist/index.d.ts"))
         );
     }
 
@@ -241,6 +209,212 @@ mod tests {
             let metadata = extract_metadata(&temp_dir.path).unwrap();
 
             assert_eq!(metadata.documentation, README_CONTENT);
+        }
+    }
+
+    mod entry_point {
+        use super::*;
+
+        #[test]
+        fn missing_types() {
+            let temp_dir = TempDir::new();
+            temp_dir
+                .create_file(
+                    "package.json",
+                    r#"{"name": "test-pkg", "version": "1.0.0"}"#,
+                )
+                .unwrap();
+
+            let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+            assert!(metadata.entry_point.is_empty());
+        }
+
+        #[test]
+        fn valid_manifest_with_typings() {
+            let temp_dir = TempDir::new();
+            temp_dir
+                .create_file(
+                    "package.json",
+                    r#"{"name": "test-pkg", "version": "1.0.0", "typings": "dist/index.d.ts"}"#,
+                )
+                .unwrap();
+
+            let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+            assert_eq!(
+                metadata.entry_point.get("."),
+                Some(&temp_dir.path.join("dist/index.d.ts"))
+            );
+        }
+
+        #[test]
+        fn valid_manifest_with_both_types_and_typings() {
+            let temp_dir = TempDir::new();
+            temp_dir
+                .create_file(
+                    "package.json",
+                    r#"{"name": "test-pkg", "version": "1.0.0", "types": "dist/types.d.ts", "typings": "dist/typings.d.ts"}"#,
+                )
+                .unwrap();
+
+            let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+            assert_eq!(
+                metadata.entry_point.get("."),
+                Some(&temp_dir.path.join("dist/types.d.ts"))
+            );
+        }
+
+        mod exports {
+            use super::*;
+
+            #[test]
+            fn no_exports() {
+                let temp_dir = TempDir::new();
+                temp_dir
+                    .create_file(
+                        "package.json",
+                        r#"{"name": "test-pkg", "version": "1.0.0", "types": "dist/index.d.ts"}"#,
+                    )
+                    .unwrap();
+
+                let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+                assert_eq!(
+                    metadata.entry_point.get("."),
+                    Some(&temp_dir.path.join("dist/index.d.ts"))
+                );
+            }
+
+            #[test]
+            fn export_without_types() {
+                let temp_dir = TempDir::new();
+                temp_dir
+                    .create_file(
+                        "package.json",
+                        r#"{
+                            "name": "test-pkg",
+                            "version": "1.0.0",
+                            "types": "dist/index.d.ts",
+                            "exports": {
+                                ".": {
+                                    "import": "./dist/index.js"
+                                }
+                            }
+                        }"#,
+                    )
+                    .unwrap();
+
+                let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+                assert!(metadata.entry_point.is_empty());
+            }
+
+            #[test]
+            fn single_type_export() {
+                let temp_dir = TempDir::new();
+                temp_dir
+                    .create_file(
+                        "package.json",
+                        r#"{
+                            "name": "test-pkg",
+                            "version": "1.0.0",
+                            "types": "dist/index.d.ts",
+                            "exports": {
+                                ".": {
+                                    "types": "./dist/index.d.ts"
+                                }
+                            }
+                        }"#,
+                    )
+                    .unwrap();
+
+                let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+                assert_eq!(metadata.entry_point.len(), 1);
+                assert_eq!(
+                    metadata.entry_point.get("."),
+                    Some(&temp_dir.path.join("dist/index.d.ts"))
+                );
+            }
+
+            #[test]
+            fn multiple_type_exports() {
+                let temp_dir = TempDir::new();
+                temp_dir
+                    .create_file(
+                        "package.json",
+                        r#"{
+                            "name": "test-pkg",
+                            "version": "1.0.0",
+                            "types": "dist/index.d.ts",
+                            "exports": {
+                                ".": {
+                                    "types": "./dist/index.d.ts"
+                                },
+                                "./utils": {
+                                    "types": "./dist/utils.d.ts"
+                                }
+                            }
+                        }"#,
+                    )
+                    .unwrap();
+
+                let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+                assert_eq!(metadata.entry_point.len(), 2);
+                assert_eq!(
+                    metadata.entry_point.get("."),
+                    Some(&temp_dir.path.join("dist/index.d.ts"))
+                );
+                assert_eq!(
+                    metadata.entry_point.get("./utils"),
+                    Some(&temp_dir.path.join("dist/utils.d.ts"))
+                );
+            }
+
+            #[test]
+            fn export_as_string() {
+                let temp_dir = TempDir::new();
+                temp_dir
+                    .create_file(
+                        "package.json",
+                        r#"{
+                            "name": "test-pkg",
+                            "version": "1.0.0",
+                            "types": "dist/index.d.ts",
+                            "exports": {
+                                ".": "./dist/index.js"
+                            }
+                        }"#,
+                    )
+                    .unwrap();
+
+                let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+                assert!(metadata.entry_point.is_empty());
+            }
+
+            #[test]
+            fn exports_as_string() {
+                let temp_dir = TempDir::new();
+                temp_dir
+                    .create_file(
+                        "package.json",
+                        r#"{
+                            "name": "test-pkg",
+                            "version": "1.0.0",
+                            "types": "dist/index.d.ts",
+                            "exports": "./dist/index.js"
+                        }"#,
+                    )
+                    .unwrap();
+
+                let metadata = extract_metadata(&temp_dir.path).unwrap();
+
+                assert!(metadata.entry_point.is_empty());
+            }
         }
     }
 }

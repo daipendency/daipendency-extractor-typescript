@@ -12,8 +12,12 @@ pub fn extract_public_api(
     library_metadata: &TSLibraryMetadata,
     parser: &mut Parser,
 ) -> Result<Vec<Namespace>, ExtractionError> {
-    let source_code = std::fs::read_to_string(&library_metadata.entry_point.types_path)
-        .map_err(ExtractionError::Io)?;
+    let types_path = library_metadata
+        .entry_point
+        .get(".")
+        .ok_or_else(|| ExtractionError::Malformed("No types path specified".to_string()))?;
+
+    let source_code = std::fs::read_to_string(types_path).map_err(ExtractionError::Io)?;
 
     let tree = parser
         .parse(&source_code, None)
@@ -125,13 +129,14 @@ mod tests {
             .unwrap();
         temp_dir.create_file("index.d.ts", content).unwrap();
 
+        let mut entry_point = TSEntryPoint::new();
+        entry_point.insert(".".to_string(), temp_dir.path.join("index.d.ts"));
+
         let library_metadata = TSLibraryMetadata {
             name: "test-pkg".to_string(),
             version: Some("1.0.0".to_string()),
             documentation: String::new(),
-            entry_point: TSEntryPoint {
-                types_path: temp_dir.path.join("index.d.ts"),
-            },
+            entry_point,
         };
 
         (temp_dir, library_metadata)
