@@ -1,4 +1,5 @@
 mod module;
+mod module_graph;
 mod parsing;
 #[cfg(test)]
 mod test_helpers;
