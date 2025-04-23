@@ -14,7 +14,7 @@ use crate::metadata::TSEntryPoint;
 /// We derive Default to allow creating an empty ModuleSet instance with ModuleSet::default().
 /// This is useful in cases where you need to initialize a ModuleSet before populating it.
 #[derive(Debug, Default)]
-pub struct ModuleSet(pub HashMap<PathBuf, Module>);
+pub struct ModuleSet(HashMap<PathBuf, Module>);
 
 impl ModuleSet {
     /// Builds a module set from the given entry points.
@@ -148,8 +148,10 @@ fn resolve_relative_import(module_path: &Path, import_path: &str) -> Option<Path
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::module::{ExportTarget, ImportTarget};
     use crate::api::test_helpers::make_parser;
     use assertables::{assert_contains, assert_matches};
+    use daipendency_extractor::Symbol;
     use daipendency_testing::tempdir::TempDir;
 
     struct EntrypointFixture {
@@ -222,10 +224,14 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 1);
-            assert_contains!(
-                modules.keys().collect::<HashSet<_>>(),
-                &fixture.make_path("index.d.ts")
+            let module = &modules[&fixture.make_path("index.d.ts")];
+            assert_eq!(module.symbols.len(), 1);
+            assert_matches!(
+                &module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, source_code },
+                    is_exported: true
+                } if name == "foo" && source_code.contains("foo: string")
             );
         }
 
@@ -243,10 +249,24 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("other.d.ts"));
+            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 1);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, source_code },
+                    is_exported: true
+                } if name == "foo" && source_code.contains("foo: string")
+            );
+            let other_module = &modules[&fixture.make_path("other.d.ts")];
+            assert_eq!(other_module.symbols.len(), 1);
+            assert_matches!(
+                &other_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, source_code },
+                    is_exported: true
+                } if name == "bar" && source_code.contains("bar: number")
+            );
         }
 
         #[test]
@@ -300,10 +320,31 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("bar.d.ts"));
+            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, aliases }
+                } if source_module == "./bar" && names.len() == 1 && names[0] == "Bar" && aliases.is_empty()
+            );
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "foo"
+            );
+            let bar_module = &modules[&fixture.make_path("bar.d.ts")];
+            assert_eq!(bar_module.symbols.len(), 1);
+            assert_matches!(
+                &bar_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Bar"
+            );
         }
 
         #[test]
@@ -327,11 +368,47 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 3);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("bar.d.ts"));
-            assert_contains!(keys, &fixture.make_path("baz.d.ts"));
+            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./bar" && names.contains(&"Bar".to_string())
+            );
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "foo"
+            );
+            let bar_module = &modules[&fixture.make_path("bar.d.ts")];
+            assert_eq!(bar_module.symbols.len(), 2);
+            assert_matches!(
+                &bar_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./baz" && names.contains(&"Baz".to_string())
+            );
+            assert_matches!(
+                &bar_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Bar"
+            );
+            let baz_module = &modules[&fixture.make_path("baz.d.ts")];
+            assert_eq!(baz_module.symbols.len(), 1);
+            assert_matches!(
+                &baz_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Baz"
+            );
         }
 
         #[test]
@@ -354,10 +431,38 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("a.d.ts"));
-            assert_contains!(keys, &fixture.make_path("b.d.ts"));
+            let a_module = &modules[&fixture.make_path("a.d.ts")];
+            assert_eq!(a_module.symbols.len(), 2);
+            assert_matches!(
+                &a_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./b" && names.contains(&"B".to_string())
+            );
+            assert_matches!(
+                &a_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "A"
+            );
+            let b_module = &modules[&fixture.make_path("b.d.ts")];
+            assert_eq!(b_module.symbols.len(), 2);
+            assert_matches!(
+                &b_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./a" && names.contains(&"A".to_string())
+            );
+            assert_matches!(
+                &b_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "B"
+            );
         }
 
         #[test]
@@ -377,10 +482,24 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("other-module.d.ts"));
+            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 1);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleExport {
+                    source_module: Some(source_module),
+                    target: ExportTarget::Named { names, .. }
+                } if source_module == "./other-module" && names.contains(&"Something".to_string())
+            );
+            let other_module = &modules[&fixture.make_path("other-module.d.ts")];
+            assert_eq!(other_module.symbols.len(), 1);
+            assert_matches!(
+                &other_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Something"
+            );
         }
     }
 
@@ -404,10 +523,31 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("src/index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("src/foo.d.ts"));
+            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./foo" && names.contains(&"Foo".to_string())
+            );
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "bar"
+            );
+            let foo_module = &modules[&fixture.make_path("src/foo.d.ts")];
+            assert_eq!(foo_module.symbols.len(), 1);
+            assert_matches!(
+                &foo_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Foo"
+            );
         }
 
         #[test]
@@ -424,10 +564,31 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("src/nested/child-module.d.ts"));
-            assert_contains!(keys, &fixture.make_path("src/parent-module.d.ts"));
+            let parent_module = &modules[&fixture.make_path("src/parent-module.d.ts")];
+            assert_eq!(parent_module.symbols.len(), 1);
+            assert_matches!(
+                &parent_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "ParentExport"
+            );
+            let child_module = &modules[&fixture.make_path("src/nested/child-module.d.ts")];
+            assert_eq!(child_module.symbols.len(), 2);
+            assert_matches!(
+                &child_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "../parent-module" && names.contains(&"ParentExport".to_string())
+            );
+            assert_matches!(
+                &child_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "child"
+            );
         }
 
         #[test]
@@ -450,53 +611,30 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("src/index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("src/utils/index.d.ts"));
-        }
-
-        #[test]
-        fn typescript_extension_variants() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "src/index.d.ts",
-                        "import { Foo } from './foo';\nexport const bar: Foo;",
-                    ),
-                    ("src/foo.ts", "export interface Foo { value: string; }"),
-                ],
-                [("main", "src/index.d.ts")],
+            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./utils" && names.contains(&"Foo".to_string())
             );
-            let entrypoints = fixture.generate_entry_points();
-            let mut parser = make_parser();
-
-            let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
-
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("src/index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("src/foo.ts"));
-        }
-
-        #[test]
-        fn non_relative_import_is_ignored() {
-            let fixture = EntrypointFixture::new(
-                [(
-                    "index.d.ts",
-                    "import { Something } from 'external-module';\nexport const foo: Something;",
-                )],
-                [("main", "index.d.ts")],
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "bar"
             );
-            let entrypoints = fixture.generate_entry_points();
-            let mut parser = make_parser();
-
-            let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
-
-            assert_eq!(modules.len(), 1);
-            assert_contains!(
-                modules.keys().collect::<HashSet<_>>(),
-                &fixture.make_path("index.d.ts")
+            let utils_module = &modules[&fixture.make_path("src/utils/index.d.ts")];
+            assert_eq!(utils_module.symbols.len(), 1);
+            assert_matches!(
+                &utils_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Foo"
             );
         }
 
@@ -520,10 +658,107 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("src/index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("src/utils/index.ts"));
+            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./utils" && names.contains(&"Foo".to_string())
+            );
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "bar"
+            );
+            let utils_module = &modules[&fixture.make_path("src/utils/index.ts")];
+            assert_eq!(utils_module.symbols.len(), 1);
+            assert_matches!(
+                &utils_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Foo"
+            );
+        }
+
+        #[test]
+        fn typescript_extension_variants() {
+            let fixture = EntrypointFixture::new(
+                [
+                    (
+                        "src/index.d.ts",
+                        "import { Foo } from './foo';\nexport const bar: Foo;",
+                    ),
+                    ("src/foo.ts", "export interface Foo { value: string; }"),
+                ],
+                [("main", "src/index.d.ts")],
+            );
+            let entrypoints = fixture.generate_entry_points();
+            let mut parser = make_parser();
+
+            let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+
+            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./foo" && names.contains(&"Foo".to_string())
+            );
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "bar"
+            );
+            let foo_module = &modules[&fixture.make_path("src/foo.ts")];
+            assert_eq!(foo_module.symbols.len(), 1);
+            assert_matches!(
+                &foo_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Foo"
+            );
+        }
+
+        #[test]
+        fn non_relative_import_is_ignored() {
+            let fixture = EntrypointFixture::new(
+                [(
+                    "index.d.ts",
+                    "import { Something } from 'external-module';\nexport const foo: Something;",
+                )],
+                [("main", "index.d.ts")],
+            );
+            let entrypoints = fixture.generate_entry_points();
+            let mut parser = make_parser();
+
+            let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+
+            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "external-module" && names.contains(&"Something".to_string())
+            );
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "foo"
+            );
         }
 
         #[test]
@@ -543,10 +778,31 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            assert_eq!(modules.len(), 2);
-            let keys: HashSet<_> = modules.keys().collect();
-            assert_contains!(keys, &fixture.make_path("src/index.d.ts"));
-            assert_contains!(keys, &fixture.make_path("src/exact-file"));
+            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            assert_eq!(index_module.symbols.len(), 2);
+            assert_matches!(
+                &index_module.symbols[0],
+                TypeScriptSymbol::ModuleImport {
+                    source_module,
+                    target: ImportTarget::Named { names, .. }
+                } if source_module == "./exact-file" && names.contains(&"Foo".to_string())
+            );
+            assert_matches!(
+                &index_module.symbols[1],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "bar"
+            );
+            let exact_file_module = &modules[&fixture.make_path("src/exact-file")];
+            assert_eq!(exact_file_module.symbols.len(), 1);
+            assert_matches!(
+                &exact_file_module.symbols[0],
+                TypeScriptSymbol::Symbol {
+                    symbol: Symbol { name, .. },
+                    is_exported: true
+                } if name == "Foo"
+            );
         }
 
         #[test]
