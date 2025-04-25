@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::fs::read_to_string;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +14,7 @@ use crate::metadata::TSEntryPointSet;
 /// We derive Default to allow creating an empty ModuleSet instance with ModuleSet::default().
 /// This is useful in cases where you need to initialize a ModuleSet before populating it.
 #[derive(Debug, Default)]
-pub struct ModuleSet(HashMap<PathBuf, Module>);
+pub struct ModuleSet(HashSet<Module>);
 
 impl ModuleSet {
     /// Builds a module set from the given entry points.
@@ -31,7 +31,7 @@ impl ModuleSet {
         entry_points: &TSEntryPointSet,
         parser: &mut Parser,
     ) -> Result<Self, ExtractionError> {
-        let mut modules = HashMap::new();
+        let mut modules = HashSet::new();
         let mut queue = VecDeque::new();
         let mut visited_paths = HashSet::new();
 
@@ -56,22 +56,36 @@ impl ModuleSet {
                     )));
                 }
             };
-            let module = parse_typescript_file(&content, parser)?;
-            modules.insert(current_path.clone(), module.clone());
+            let module = parse_typescript_file(&content, parser, current_path.clone())?;
 
-            let dependencies = get_imported_module_paths(&module, &current_path);
+            let dependencies = get_imported_module_paths(&module);
             for dependency in dependencies {
                 queue.push_back(dependency);
             }
+
+            modules.insert(module);
         }
 
         Ok(ModuleSet(modules))
     }
+
+    /// Gets a module by its path.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - The path of the module to find
+    ///
+    /// # Returns
+    ///
+    /// The module if found, or None otherwise
+    pub fn get(&self, path: &Path) -> Option<&Module> {
+        self.0.iter().find(|module| module.path == path)
+    }
 }
 
-/// Provides HashMap-like access semantics without needing to reference the inner field
+/// Provides HashSet-like access semantics without needing to reference the inner field
 impl std::ops::Deref for ModuleSet {
-    type Target = HashMap<PathBuf, Module>;
+    type Target = HashSet<Module>;
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -87,8 +101,9 @@ fn normalise_file_path(path: &PathBuf) -> Option<PathBuf> {
     None
 }
 
-fn get_imported_module_paths(module: &Module, path: &Path) -> Vec<PathBuf> {
+fn get_imported_module_paths(module: &Module) -> Vec<PathBuf> {
     let mut dependencies = Vec::new();
+    let path = &module.path;
 
     for symbol in &module.symbols {
         if let TypeScriptSymbol::ModuleImport { source_module, .. } = symbol {
@@ -201,6 +216,43 @@ mod tests {
         }
     }
 
+    mod get {
+        use super::*;
+
+        #[test]
+        fn returns_module_when_found() {
+            let path = PathBuf::from("/test/path.ts");
+            let module = Module {
+                path: path.clone(),
+                jsdoc: None,
+                symbols: vec![],
+                default_export_name: None,
+            };
+            let module_set = ModuleSet(HashSet::from([module.clone()]));
+
+            let module_retrieved = module_set.get(path.as_path()).unwrap();
+
+            assert_eq!(module_retrieved, &module);
+        }
+
+        #[test]
+        fn returns_none_when_not_found() {
+            let path = PathBuf::from("/test/path.ts");
+            let module = Module {
+                path,
+                jsdoc: None,
+                symbols: vec![],
+                default_export_name: None,
+            };
+            let module_set = ModuleSet(HashSet::from([module.clone()]));
+            let non_existent_path = PathBuf::from("/test/non_existent.ts");
+
+            let module_retrieved = module_set.get(non_existent_path.as_path());
+
+            assert_eq!(module_retrieved, None);
+        }
+    }
+
     mod from_entrypoints {
         use super::*;
         use std::collections::HashSet;
@@ -208,7 +260,6 @@ mod tests {
         #[test]
         fn empty_metadata() {
             let fixture = EntrypointFixture::new([]);
-
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -229,7 +280,8 @@ mod tests {
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
 
-            let module = &modules[&fixture.make_path("index.d.ts")];
+            let path = fixture.make_path("index.d.ts");
+            let module = modules.get(&path).unwrap();
             assert_eq!(module.symbols.len(), 1);
             assert_matches!(
                 &module.symbols[0],
@@ -258,8 +310,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("index.d.ts");
+            let other_path = fixture.make_path("other.d.ts");
 
-            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 1);
             assert_matches!(
                 &index_module.symbols[0],
@@ -268,7 +322,8 @@ mod tests {
                     is_exported: true
                 } if name == "foo" && source_code.contains("foo: string")
             );
-            let other_module = &modules[&fixture.make_path("other.d.ts")];
+
+            let other_module = modules.get(&other_path).unwrap();
             assert_eq!(other_module.symbols.len(), 1);
             assert_matches!(
                 &other_module.symbols[0],
@@ -334,8 +389,8 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
-
-            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            let index_path = fixture.make_path("index.d.ts");
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -351,7 +406,9 @@ mod tests {
                     is_exported: true
                 } if name == "foo"
             );
-            let bar_module = &modules[&fixture.make_path("bar.d.ts")];
+
+            let bar_path = fixture.make_path("bar.d.ts");
+            let bar_module = modules.get(&bar_path).unwrap();
             assert_eq!(bar_module.symbols.len(), 1);
             assert_matches!(
                 &bar_module.symbols[0],
@@ -385,8 +442,8 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
-
-            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            let index_path = fixture.make_path("index.d.ts");
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -402,7 +459,9 @@ mod tests {
                     is_exported: true
                 } if name == "foo"
             );
-            let bar_module = &modules[&fixture.make_path("bar.d.ts")];
+
+            let bar_path = fixture.make_path("bar.d.ts");
+            let bar_module = modules.get(&bar_path).unwrap();
             assert_eq!(bar_module.symbols.len(), 2);
             assert_matches!(
                 &bar_module.symbols[0],
@@ -418,7 +477,9 @@ mod tests {
                     is_exported: true
                 } if name == "Bar"
             );
-            let baz_module = &modules[&fixture.make_path("baz.d.ts")];
+
+            let baz_path = fixture.make_path("baz.d.ts");
+            let baz_module = modules.get(&baz_path).unwrap();
             assert_eq!(baz_module.symbols.len(), 1);
             assert_matches!(
                 &baz_module.symbols[0],
@@ -447,8 +508,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let a_path = fixture.make_path("a.d.ts");
+            let b_path = fixture.make_path("b.d.ts");
 
-            let a_module = &modules[&fixture.make_path("a.d.ts")];
+            let a_module = modules.get(&a_path).unwrap();
             assert_eq!(a_module.symbols.len(), 2);
             assert_matches!(
                 &a_module.symbols[0],
@@ -464,7 +527,8 @@ mod tests {
                     is_exported: true
                 } if name == "A"
             );
-            let b_module = &modules[&fixture.make_path("b.d.ts")];
+
+            let b_module = modules.get(&b_path).unwrap();
             assert_eq!(b_module.symbols.len(), 2);
             assert_matches!(
                 &b_module.symbols[0],
@@ -500,8 +564,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("index.d.ts");
+            let other_path = fixture.make_path("other-module.d.ts");
 
-            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 1);
             assert_matches!(
                 &index_module.symbols[0],
@@ -510,7 +576,8 @@ mod tests {
                     target: ExportTarget::Named { names, .. }
                 } if source_module == "./other-module" && names.contains(&"Something".to_string())
             );
-            let other_module = &modules[&fixture.make_path("other-module.d.ts")];
+
+            let other_module = modules.get(&other_path).unwrap();
             assert_eq!(other_module.symbols.len(), 1);
             assert_matches!(
                 &other_module.symbols[0],
@@ -543,8 +610,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("src/index.d.ts");
+            let foo_path = fixture.make_path("src/foo.d.ts");
 
-            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -560,7 +629,8 @@ mod tests {
                     is_exported: true
                 } if name == "bar"
             );
-            let foo_module = &modules[&fixture.make_path("src/foo.d.ts")];
+
+            let foo_module = modules.get(&foo_path).unwrap();
             assert_eq!(foo_module.symbols.len(), 1);
             assert_matches!(
                 &foo_module.symbols[0],
@@ -589,8 +659,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let parent_path = fixture.make_path("src/parent-module.d.ts");
+            let child_path = fixture.make_path("src/nested/child-module.d.ts");
 
-            let parent_module = &modules[&fixture.make_path("src/parent-module.d.ts")];
+            let parent_module = modules.get(&parent_path).unwrap();
             assert_eq!(parent_module.symbols.len(), 1);
             assert_matches!(
                 &parent_module.symbols[0],
@@ -599,7 +671,8 @@ mod tests {
                     is_exported: true
                 } if name == "ParentExport"
             );
-            let child_module = &modules[&fixture.make_path("src/nested/child-module.d.ts")];
+
+            let child_module = modules.get(&child_path).unwrap();
             assert_eq!(child_module.symbols.len(), 2);
             assert_matches!(
                 &child_module.symbols[0],
@@ -635,8 +708,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("src/index.d.ts");
+            let utils_path = fixture.make_path("src/utils/index.d.ts");
 
-            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -652,7 +727,8 @@ mod tests {
                     is_exported: true
                 } if name == "bar"
             );
-            let utils_module = &modules[&fixture.make_path("src/utils/index.d.ts")];
+
+            let utils_module = modules.get(&utils_path).unwrap();
             assert_eq!(utils_module.symbols.len(), 1);
             assert_matches!(
                 &utils_module.symbols[0],
@@ -681,8 +757,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("src/index.d.ts");
+            let utils_path = fixture.make_path("src/utils/index.ts");
 
-            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -698,7 +776,8 @@ mod tests {
                     is_exported: true
                 } if name == "bar"
             );
-            let utils_module = &modules[&fixture.make_path("src/utils/index.ts")];
+
+            let utils_module = modules.get(&utils_path).unwrap();
             assert_eq!(utils_module.symbols.len(), 1);
             assert_matches!(
                 &utils_module.symbols[0],
@@ -727,8 +806,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("src/index.d.ts");
+            let foo_path = fixture.make_path("src/foo.ts");
 
-            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -744,7 +825,8 @@ mod tests {
                     is_exported: true
                 } if name == "bar"
             );
-            let foo_module = &modules[&fixture.make_path("src/foo.ts")];
+
+            let foo_module = modules.get(&foo_path).unwrap();
             assert_eq!(foo_module.symbols.len(), 1);
             assert_matches!(
                 &foo_module.symbols[0],
@@ -767,8 +849,9 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("index.d.ts");
 
-            let index_module = &modules[&fixture.make_path("index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -804,8 +887,10 @@ mod tests {
             let mut parser = make_parser();
 
             let modules = ModuleSet::from_entrypoints(&entrypoints, &mut parser).unwrap();
+            let index_path = fixture.make_path("src/index.d.ts");
+            let exact_file_path = fixture.make_path("src/exact-file");
 
-            let index_module = &modules[&fixture.make_path("src/index.d.ts")];
+            let index_module = modules.get(&index_path).unwrap();
             assert_eq!(index_module.symbols.len(), 2);
             assert_matches!(
                 &index_module.symbols[0],
@@ -821,7 +906,8 @@ mod tests {
                     is_exported: true
                 } if name == "bar"
             );
-            let exact_file_module = &modules[&fixture.make_path("src/exact-file")];
+
+            let exact_file_module = modules.get(&exact_file_path).unwrap();
             assert_eq!(exact_file_module.symbols.len(), 1);
             assert_matches!(
                 &exact_file_module.symbols[0],

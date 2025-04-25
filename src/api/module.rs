@@ -1,17 +1,20 @@
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 
 use daipendency_extractor::Symbol;
 
 /// A TypeScript module (i.e. a file).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Module {
+    pub path: PathBuf,
     pub jsdoc: Option<String>,
     pub symbols: Vec<TypeScriptSymbol>,
     pub default_export_name: Option<String>,
 }
 
 /// The target of an import in a TypeScript module.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportTarget {
     /// The default export from another module (e.g. `import React from 'react';`).
     Default {
@@ -32,8 +35,28 @@ pub enum ImportTarget {
     },
 }
 
+impl Hash for ImportTarget {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            ImportTarget::Default { name } => {
+                0.hash(state);
+                name.hash(state);
+            }
+            ImportTarget::Namespace { name } => {
+                1.hash(state);
+                name.hash(state);
+            }
+            ImportTarget::Named { names, .. } => {
+                2.hash(state);
+                names.hash(state);
+                // Skip aliases in hash calculation as HashMap doesn't implement Hash
+            }
+        }
+    }
+}
+
 /// The target of an export in a TypeScript module.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExportTarget {
     /// A namespace export from another module (e.g. `export * as React from 'react';`).
     Namespace {
@@ -51,8 +74,27 @@ pub enum ExportTarget {
     Barrel,
 }
 
+impl Hash for ExportTarget {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            ExportTarget::Namespace { name } => {
+                0.hash(state);
+                name.hash(state);
+            }
+            ExportTarget::Named { names, .. } => {
+                1.hash(state);
+                names.hash(state);
+                // Skip aliases in hash calculation as HashMap doesn't implement Hash
+            }
+            ExportTarget::Barrel => {
+                2.hash(state);
+            }
+        }
+    }
+}
+
 /// A symbol in a TypeScript module.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeScriptSymbol {
     /// A symbol (e.g. class, interface, function, constant, type alias).
     Symbol {

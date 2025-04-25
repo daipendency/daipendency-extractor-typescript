@@ -1,5 +1,6 @@
 use daipendency_extractor::{ExtractionError, ParsedFile, Symbol};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Node, Parser, QueryCursor};
 
@@ -106,6 +107,7 @@ const EXPORTS_QUERY: &str = r#"
 pub fn parse_typescript_file(
     content: &str,
     parser: &mut Parser,
+    file_path: PathBuf,
 ) -> Result<Module, ExtractionError> {
     let parsed_file = ParsedFile::parse(content, parser)?;
     let root_node = parsed_file.root_node();
@@ -115,6 +117,7 @@ pub fn parse_typescript_file(
     let default_export_name = extract_default_export_name(root_node, &parsed_file)?;
 
     Ok(Module {
+        path: file_path,
         jsdoc,
         symbols,
         default_export_name,
@@ -548,19 +551,30 @@ mod tests {
     #[test]
     fn empty_file() {
         let mut parser = make_parser();
+        let path = PathBuf::from("/test/empty.ts");
 
-        let result = parse_typescript_file("", &mut parser);
+        let result = parse_typescript_file("", &mut parser, path.clone());
 
-        assert_matches!(result, Ok(Module { jsdoc: None, symbols: s, default_export_name: None }) if s.is_empty());
+        assert_matches!(result, Ok(Module { path: p, jsdoc: None, symbols: s, default_export_name: None }) if p == path && s.is_empty());
     }
 
     #[test]
     fn malformed_file() {
         let mut parser = make_parser();
 
-        let result = parse_typescript_file("class {", &mut parser);
+        let result = parse_typescript_file("class {", &mut parser, PathBuf::new());
 
         assert_matches!(result, Err(ExtractionError::Malformed(msg)) if msg == "Failed to parse source file");
+    }
+
+    #[test]
+    fn file_path_is_preserved() {
+        let mut parser = make_parser();
+        let test_path = PathBuf::from("/test/file/path.ts");
+
+        let result = parse_typescript_file("const foo = 42;", &mut parser, test_path.clone());
+
+        assert_matches!(result, Ok(Module { path, .. }) if path == test_path);
     }
 
     mod module_jsdoc {
@@ -573,7 +587,7 @@ mod tests {
             let mut parser = make_parser();
             let content = format!("/** @file {FILE_DESCRIPTION} */\ndeclare const foo = 42;");
 
-            let result = parse_typescript_file(&content, &mut parser);
+            let result = parse_typescript_file(&content, &mut parser, PathBuf::new());
 
             assert_matches!(result, Ok(Module { jsdoc: Some(j), .. }) if j == format!("/** @file {FILE_DESCRIPTION} */"));
         }
@@ -584,7 +598,7 @@ mod tests {
             let content =
                 format!("/** @fileoverview {FILE_DESCRIPTION} */\ndeclare const foo = 42;");
 
-            let result = parse_typescript_file(&content, &mut parser);
+            let result = parse_typescript_file(&content, &mut parser, PathBuf::new());
 
             assert_matches!(result, Ok(Module { jsdoc: Some(j), .. }) if j == format!("/** @fileoverview {FILE_DESCRIPTION} */"));
         }
@@ -594,7 +608,7 @@ mod tests {
             let mut parser = make_parser();
             let content = format!("/** @module {FILE_DESCRIPTION} */\ndeclare const foo = 42;");
 
-            let result = parse_typescript_file(&content, &mut parser);
+            let result = parse_typescript_file(&content, &mut parser, PathBuf::new());
 
             assert_matches!(result, Ok(Module { jsdoc: Some(j), .. }) if j == format!("/** @module {FILE_DESCRIPTION} */"));
         }
@@ -604,7 +618,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "/** Just a comment */\ndeclare const foo = 42;";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let result = parse_typescript_file(content, &mut parser, PathBuf::new());
 
             assert_matches!(result, Ok(Module { jsdoc: None, .. }));
         }
@@ -614,7 +628,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "/* @module Just a comment */\ndeclare const foo = 42;";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let result = parse_typescript_file(content, &mut parser, PathBuf::new());
 
             assert_matches!(result, Ok(Module { jsdoc: None, .. }));
         }
@@ -624,7 +638,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "// @module Just a comment\ndeclare const foo = 42;";
 
-            let result = parse_typescript_file(content, &mut parser);
+            let result = parse_typescript_file(content, &mut parser, PathBuf::new());
 
             assert_matches!(result, Ok(Module { jsdoc: None, .. }));
         }
@@ -638,7 +652,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "declare class Foo { bar(): void; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -650,7 +664,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "declare abstract class Foo { bar(): void; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -662,7 +676,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "type Bar = string;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -674,7 +688,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "interface Baz { qux: number; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -686,7 +700,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "enum Status { Active, Inactive }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -698,7 +712,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "declare function greet(name: string): void;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -710,7 +724,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "declare const VERSION: string;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -722,7 +736,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "declare let counter: number;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -734,7 +748,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "/** The version number */\ndeclare const VERSION: string;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -746,7 +760,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "declare const VERSION: string;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -758,7 +772,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "/** @module The module description */\ndeclare const VERSION: string;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -770,7 +784,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "// The comment\ndeclare const VERSION: string;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -782,7 +796,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export declare function greet(name: string): void;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(module, Module { ref symbols, .. } if symbols.len() == 1);
             let symbol = &module.symbols[0];
@@ -794,7 +808,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export default declare function greet(name: string): void;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, default_export_name: Some(n), .. } if symbols.len() == 1 && n == "greet");
             let symbol = &module.symbols[0];
@@ -812,7 +826,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "namespace Foo {}";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
             let namespace = &module.symbols[0];
@@ -825,7 +839,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "namespace Foo { declare const VERSION: string; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
             let namespace = &module.symbols[0];
@@ -838,7 +852,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export namespace Foo { declare const VERSION: string; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
             let namespace = &module.symbols[0];
@@ -858,7 +872,7 @@ mod tests {
             let content =
                 "namespace Foo { declare const VERSION: string; declare function greet(): void; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
             let namespace = &module.symbols[0];
@@ -872,7 +886,7 @@ mod tests {
             let content =
                 "namespace Foo { namespace Bar { export declare const VERSION: string; } }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
             let (outer_name, outer_content, outer_exported, outer_jsdoc) =
@@ -899,7 +913,7 @@ mod tests {
             let content =
                 "/** Utility functions */\nnamespace Foo { declare const VERSION: string; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
             let namespace = &module.symbols[0];
@@ -912,7 +926,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "namespace Foo { declare const VERSION: string; }";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_eq!(module.symbols.len(), 1);
             let namespace = &module.symbols[0];
@@ -929,7 +943,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "import foo from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
@@ -942,7 +956,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "import * as foo from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
@@ -955,7 +969,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "import { foo } from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
@@ -968,7 +982,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "import { foo as bar } from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
@@ -981,7 +995,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "import foo, { bar } from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 2);
 
@@ -999,7 +1013,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "import { foo, bar as baz } from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_import(&module.symbols[0]);
@@ -1017,7 +1031,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export * as foo from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
@@ -1030,7 +1044,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export { foo, bar } from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
@@ -1043,7 +1057,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export { foo as bar } from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
@@ -1056,7 +1070,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export * from './foo.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
@@ -1069,7 +1083,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "\nexport { VERSION };";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
@@ -1082,7 +1096,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export = myFunction;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
@@ -1095,7 +1109,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export default VERSION;";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { default_export_name: Some(n), .. } if n == "VERSION");
         }
@@ -1105,7 +1119,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export { foo, bar as baz } from './module.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 1);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
@@ -1118,7 +1132,7 @@ mod tests {
             let mut parser = make_parser();
             let content = "export { foo } from './foo.js';\nexport { bar } from './bar.js';";
 
-            let module = parse_typescript_file(content, &mut parser).unwrap();
+            let module = parse_typescript_file(content, &mut parser, PathBuf::new()).unwrap();
 
             assert_matches!(&module, Module { symbols, .. } if symbols.len() == 2);
             let (source_module, target) = deconstruct_module_export(&module.symbols[0]);
