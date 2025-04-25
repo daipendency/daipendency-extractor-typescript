@@ -7,7 +7,7 @@ use tree_sitter::Parser;
 
 use crate::api::module::{Module, TypeScriptSymbol};
 use crate::api::parsing::parse_typescript_file;
-use crate::metadata::TSEntryPoint;
+use crate::metadata::TSEntryPointSet;
 
 /// Represents a set of TypeScript modules.
 ///
@@ -21,22 +21,22 @@ impl ModuleSet {
     ///
     /// # Arguments
     ///
-    /// * `entry_points` - A map of entry point names to file paths
+    /// * `entry_points` - A set of entry points connecting external paths to internal file paths
     /// * `parser` - A tree-sitter parser configured for TypeScript
     ///
     /// # Returns
     ///
     /// A complete set of modules reachable from the entry points
     pub fn from_entrypoints(
-        entry_points: &TSEntryPoint,
+        entry_points: &TSEntryPointSet,
         parser: &mut Parser,
     ) -> Result<Self, ExtractionError> {
         let mut modules = HashMap::new();
         let mut queue = VecDeque::new();
         let mut visited_paths = HashSet::new();
 
-        for path in entry_points.values() {
-            queue.push_back(path.clone());
+        for entry_point in entry_points {
+            queue.push_back(entry_point.internal_path.clone());
         }
 
         while let Some(current_path) = queue.pop_front() {
@@ -150,36 +150,30 @@ mod tests {
     use super::*;
     use crate::api::module::{ExportTarget, ImportTarget};
     use crate::api::test_helpers::make_parser;
+    use crate::metadata::TSEntryPoint;
     use assertables::{assert_contains, assert_matches};
     use daipendency_extractor::Symbol;
     use daipendency_testing::tempdir::TempDir;
 
+    struct ModuleFixture {
+        entrypoint: Option<&'static str>,
+        path: &'static str,
+        content: &'static str,
+    }
+
     struct EntrypointFixture {
         temp_dir: TempDir,
-        files: HashMap<String, String>,
-        entrypoints: HashMap<String, String>,
+        modules: Vec<ModuleFixture>,
     }
 
     impl EntrypointFixture {
-        fn new<F, E>(files: F, entrypoints: E) -> Self
+        fn new<M>(modules: M) -> Self
         where
-            F: IntoIterator<Item = (&'static str, &'static str)>,
-            E: IntoIterator<Item = (&'static str, &'static str)>,
+            M: IntoIterator<Item = ModuleFixture>,
         {
-            let files_map = files
-                .into_iter()
-                .map(|(path, content)| (path.to_string(), content.to_string()))
-                .collect();
-
-            let entrypoints_map = entrypoints
-                .into_iter()
-                .map(|(key, path)| (key.to_string(), path.to_string()))
-                .collect();
-
             Self {
                 temp_dir: TempDir::new(),
-                files: files_map,
-                entrypoints: entrypoints_map,
+                modules: modules.into_iter().collect(),
             }
         }
 
@@ -187,24 +181,34 @@ mod tests {
             self.temp_dir.path.join(path)
         }
 
-        fn generate_entry_points(&self) -> TSEntryPoint {
-            for (path, content) in &self.files {
-                self.temp_dir.create_file(path, content).unwrap();
+        fn generate_entry_points(&self) -> TSEntryPointSet {
+            let mut entrypoints = HashSet::new();
+
+            for module in &self.modules {
+                self.temp_dir
+                    .create_file(module.path, module.content)
+                    .unwrap();
+
+                if let Some(name) = module.entrypoint {
+                    entrypoints.insert(TSEntryPoint {
+                        external_path: name.to_string(),
+                        internal_path: self.make_path(module.path),
+                    });
+                }
             }
 
-            self.entrypoints
-                .iter()
-                .map(|(key, path)| (key.clone(), self.make_path(path)))
-                .collect()
+            entrypoints
         }
     }
 
     mod from_entrypoints {
         use super::*;
+        use std::collections::HashSet;
 
         #[test]
         fn empty_metadata() {
-            let fixture = EntrypointFixture::new([], []);
+            let fixture = EntrypointFixture::new([]);
+
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -215,10 +219,11 @@ mod tests {
 
         #[test]
         fn single_entry_point() {
-            let fixture = EntrypointFixture::new(
-                [("index.d.ts", "export const foo: string;")],
-                [("main", "index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([ModuleFixture {
+                entrypoint: Some("main"),
+                path: "index.d.ts",
+                content: "export const foo: string;",
+            }]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -237,13 +242,18 @@ mod tests {
 
         #[test]
         fn multiple_entry_points() {
-            let fixture = EntrypointFixture::new(
-                [
-                    ("index.d.ts", "export const foo: string;"),
-                    ("other.d.ts", "export const bar: number;"),
-                ],
-                [("main", "index.d.ts"), ("other", "other.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "index.d.ts",
+                    content: "export const foo: string;",
+                },
+                ModuleFixture {
+                    entrypoint: Some("other"),
+                    path: "other.d.ts",
+                    content: "export const bar: number;",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -272,8 +282,10 @@ mod tests {
         #[test]
         fn non_existing_entry_point() {
             let path = PathBuf::from("./non-existing-file.d.ts");
-            let entrypoints: TSEntryPoint =
-                [("main".to_string(), path.clone())].into_iter().collect();
+            let entrypoints: TSEntryPointSet = HashSet::from([TSEntryPoint {
+                external_path: "main".to_string(),
+                internal_path: path.clone(),
+            }]);
             let mut parser = make_parser();
 
             let result = ModuleSet::from_entrypoints(&entrypoints, &mut parser);
@@ -287,10 +299,11 @@ mod tests {
 
         #[test]
         fn parsing_error() {
-            let fixture = EntrypointFixture::new(
-                [("index.d.ts", "export const foo: @invalid-type;")],
-                [("main", "index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([ModuleFixture {
+                entrypoint: Some("main"),
+                path: "index.d.ts",
+                content: "export const foo: @invalid-type;",
+            }]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -305,16 +318,18 @@ mod tests {
 
         #[test]
         fn direct_import() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "index.d.ts",
-                        "import { Bar } from './bar';\nexport const foo: string;",
-                    ),
-                    ("bar.d.ts", "export interface Bar { prop: string; }"),
-                ],
-                [("main", "index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "index.d.ts",
+                    content: "import { Bar } from './bar';\nexport const foo: string;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "bar.d.ts",
+                    content: "export interface Bar { prop: string; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -349,20 +364,23 @@ mod tests {
 
         #[test]
         fn transitive_dependencies() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "index.d.ts",
-                        "import { Bar } from './bar';\nexport const foo: string;",
-                    ),
-                    (
-                        "bar.d.ts",
-                        "import { Baz } from './baz';\nexport interface Bar { prop: Baz; }",
-                    ),
-                    ("baz.d.ts", "export interface Baz { value: number; }"),
-                ],
-                [("main", "index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "index.d.ts",
+                    content: "import { Bar } from './bar';\nexport const foo: string;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "bar.d.ts",
+                    content: "import { Baz } from './baz';\nexport interface Bar { prop: Baz; }",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "baz.d.ts",
+                    content: "export interface Baz { value: number; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -413,19 +431,18 @@ mod tests {
 
         #[test]
         fn circular_dependencies() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "a.d.ts",
-                        "import { B } from './b';\nexport interface A { b: B; }",
-                    ),
-                    (
-                        "b.d.ts",
-                        "import { A } from './a';\nexport interface B { a: A; }",
-                    ),
-                ],
-                [("main", "a.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "a.d.ts",
+                    content: "import { B } from './b';\nexport interface A { b: B; }",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "b.d.ts",
+                    content: "import { A } from './a';\nexport interface B { a: A; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -467,16 +484,18 @@ mod tests {
 
         #[test]
         fn reexport_dependencies() {
-            let fixture = EntrypointFixture::new(
-                [
-                    ("index.d.ts", "export { Something } from './other-module';"),
-                    (
-                        "other-module.d.ts",
-                        "export interface Something { value: number; }",
-                    ),
-                ],
-                [("main", "index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "index.d.ts",
+                    content: "export { Something } from './other-module';",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "other-module.d.ts",
+                    content: "export interface Something { value: number; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -508,16 +527,18 @@ mod tests {
 
         #[test]
         fn relative_path() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "src/index.d.ts",
-                        "import { Foo } from './foo';\nexport const bar: Foo;",
-                    ),
-                    ("src/foo.d.ts", "export interface Foo { value: string; }"),
-                ],
-                [("main", "src/index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "src/index.d.ts",
+                    content: "import { Foo } from './foo';\nexport const bar: Foo;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "src/foo.d.ts",
+                    content: "export interface Foo { value: string; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -552,13 +573,18 @@ mod tests {
 
         #[test]
         fn parent_directory() {
-            let fixture = EntrypointFixture::new(
-                [
-                    ("src/parent-module.d.ts", "export interface ParentExport { value: string; }"),
-                    ("src/nested/child-module.d.ts", "import { ParentExport } from '../parent-module';\nexport const child: ParentExport;"),
-                ],
-                [("child", "src/nested/child-module.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("child"),
+                    path: "src/nested/child-module.d.ts",
+                    content: "import { ParentExport } from '../parent-module';\nexport const child: ParentExport;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "src/parent-module.d.ts",
+                    content: "export interface ParentExport { value: string; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -593,19 +619,18 @@ mod tests {
 
         #[test]
         fn directory_with_index() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "src/index.d.ts",
-                        "import { Foo } from './utils';\nexport const bar: Foo;",
-                    ),
-                    (
-                        "src/utils/index.d.ts",
-                        "export interface Foo { value: string; }",
-                    ),
-                ],
-                [("main", "src/index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "src/index.d.ts",
+                    content: "import { Foo } from './utils';\nexport const bar: Foo;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "src/utils/index.d.ts",
+                    content: "export interface Foo { value: string; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -640,19 +665,18 @@ mod tests {
 
         #[test]
         fn directory_with_index_ts() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "src/index.d.ts",
-                        "import { Foo } from './utils';\nexport const bar: Foo;",
-                    ),
-                    (
-                        "src/utils/index.ts",
-                        "export interface Foo { value: string; }",
-                    ),
-                ],
-                [("main", "src/index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "src/index.d.ts",
+                    content: "import { Foo } from './utils';\nexport const bar: Foo;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "src/utils/index.ts",
+                    content: "export interface Foo { value: string; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -687,16 +711,18 @@ mod tests {
 
         #[test]
         fn typescript_extension_variants() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "src/index.d.ts",
-                        "import { Foo } from './foo';\nexport const bar: Foo;",
-                    ),
-                    ("src/foo.ts", "export interface Foo { value: string; }"),
-                ],
-                [("main", "src/index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "src/index.d.ts",
+                    content: "import { Foo } from './foo';\nexport const bar: Foo;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "src/foo.ts",
+                    content: "export interface Foo { value: string; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -731,13 +757,12 @@ mod tests {
 
         #[test]
         fn non_relative_import_is_ignored() {
-            let fixture = EntrypointFixture::new(
-                [(
-                    "index.d.ts",
+            let fixture = EntrypointFixture::new([ModuleFixture {
+                entrypoint: Some("main"),
+                path: "index.d.ts",
+                content:
                     "import { Something } from 'external-module';\nexport const foo: Something;",
-                )],
-                [("main", "index.d.ts")],
-            );
+            }]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -763,16 +788,18 @@ mod tests {
 
         #[test]
         fn direct_file_resolution() {
-            let fixture = EntrypointFixture::new(
-                [
-                    (
-                        "src/index.d.ts",
-                        "import { Foo } from './exact-file';\nexport const bar: Foo;",
-                    ),
-                    ("src/exact-file", "export interface Foo { value: string; }"),
-                ],
-                [("main", "src/index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([
+                ModuleFixture {
+                    entrypoint: Some("main"),
+                    path: "src/index.d.ts",
+                    content: "import { Foo } from './exact-file';\nexport const bar: Foo;",
+                },
+                ModuleFixture {
+                    entrypoint: None,
+                    path: "src/exact-file",
+                    content: "export interface Foo { value: string; }",
+                },
+            ]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 
@@ -807,13 +834,11 @@ mod tests {
 
         #[test]
         fn non_existing_import() {
-            let fixture = EntrypointFixture::new(
-                [(
-                    "src/index.d.ts",
-                    "import nonExisting from './non-existing.ts';",
-                )],
-                [("main", "src/index.d.ts")],
-            );
+            let fixture = EntrypointFixture::new([ModuleFixture {
+                entrypoint: Some("main"),
+                path: "src/index.d.ts",
+                content: "import nonExisting from './non-existing.ts';",
+            }]);
             let entrypoints = fixture.generate_entry_points();
             let mut parser = make_parser();
 

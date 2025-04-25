@@ -1,5 +1,5 @@
 mod module;
-mod module_graph;
+mod module_set;
 mod parsing;
 #[cfg(test)]
 mod test_helpers;
@@ -15,8 +15,10 @@ pub fn extract_public_api(
 ) -> Result<Vec<Namespace>, ExtractionError> {
     let types_path = library_metadata
         .entry_point
-        .get(".")
-        .ok_or_else(|| ExtractionError::Malformed("No types path specified".to_string()))?;
+        .iter()
+        .find(|entry| entry.external_path == ".")
+        .map(|entry| &entry.internal_path)
+        .ok_or_else(|| ExtractionError::Malformed("No main types path specified".to_string()))?;
 
     let source_code = std::fs::read_to_string(types_path).map_err(ExtractionError::Io)?;
 
@@ -115,6 +117,7 @@ fn get_node_text(node: Node, source_code: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::metadata::TSEntryPoint;
+    use std::collections::HashSet;
 
     use super::test_helpers::make_parser;
     use super::*;
@@ -130,14 +133,16 @@ mod tests {
             .unwrap();
         temp_dir.create_file("index.d.ts", content).unwrap();
 
-        let mut entry_point = TSEntryPoint::new();
-        entry_point.insert(".".to_string(), temp_dir.path.join("index.d.ts"));
+        let entrypoints = HashSet::from([TSEntryPoint {
+            external_path: ".".to_string(),
+            internal_path: temp_dir.path.join("index.d.ts"),
+        }]);
 
         let library_metadata = TSLibraryMetadata {
             name: "test-pkg".to_string(),
             version: Some("1.0.0".to_string()),
             documentation: String::new(),
-            entry_point,
+            entry_point: entrypoints,
         };
 
         (temp_dir, library_metadata)

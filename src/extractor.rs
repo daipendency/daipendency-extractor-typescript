@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     api, dependencies,
-    metadata::{extract_metadata, TSEntryPoint, TSLibraryMetadata},
+    metadata::{extract_metadata, TSEntryPointSet, TSLibraryMetadata},
 };
 use daipendency_extractor::{
     DependencyResolutionError, ExtractionError, Extractor, LibraryMetadataError, Namespace,
@@ -11,7 +11,7 @@ use tree_sitter::{Language, Parser};
 
 pub struct TypeScriptExtractor;
 
-impl Extractor<TSEntryPoint> for TypeScriptExtractor {
+impl Extractor<TSEntryPointSet> for TypeScriptExtractor {
     fn get_parser_language(&self) -> Language {
         tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
     }

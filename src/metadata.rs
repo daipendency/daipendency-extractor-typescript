@@ -1,12 +1,38 @@
 use daipendency_extractor::{LibraryMetadata, LibraryMetadataError};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-pub type TSEntryPoint = HashMap<String, PathBuf>;
+/// A TypeScript entrypoint mapping external package paths to internal file paths.
+#[derive(Debug, Clone)]
+pub struct TSEntryPoint {
+    /// The external path to import this module (e.g. '.' or './utils')
+    pub external_path: String,
+    /// The internal filesystem path to the module
+    pub internal_path: PathBuf,
+}
+
+impl PartialEq for TSEntryPoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.external_path == other.external_path && self.internal_path == other.internal_path
+    }
+}
+
+impl Eq for TSEntryPoint {}
+
+impl Hash for TSEntryPoint {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.external_path.hash(state);
+        self.internal_path.hash(state);
+    }
+}
+
+/// A set of TypeScript entrypoints.
+pub type TSEntryPointSet = HashSet<TSEntryPoint>;
 
 /// TypeScript library metadata.
-pub type TSLibraryMetadata = LibraryMetadata<TSEntryPoint>;
+pub type TSLibraryMetadata = LibraryMetadata<TSEntryPointSet>;
 
 #[derive(Debug, Deserialize)]
 struct PackageJson {
@@ -35,7 +61,7 @@ pub fn extract_metadata(path: &Path) -> Result<TSLibraryMetadata, LibraryMetadat
     let package_json: PackageJson = serde_json::from_str(&content)
         .map_err(|e| LibraryMetadataError::MalformedManifest(e.to_string()))?;
 
-    let entry_point = get_entry_point(&package_json, path);
+    let entry_point = get_entry_point_set(&package_json, path);
 
     let documentation = read_readme(path);
 
@@ -57,8 +83,8 @@ fn read_readme(path: &Path) -> String {
     String::new()
 }
 
-fn get_entry_point(package_json: &PackageJson, path: &Path) -> TSEntryPoint {
-    let mut entry_point = HashMap::new();
+fn get_entry_point_set(package_json: &PackageJson, path: &Path) -> TSEntryPointSet {
+    let mut entry_point = HashSet::new();
 
     // Handle exports
     if let Some(export_config) = &package_json.exports {
@@ -67,10 +93,10 @@ fn get_entry_point(package_json: &PackageJson, path: &Path) -> TSEntryPoint {
                 for (subpath, config) in export_map {
                     if let ExportConfig::Map(conditions) = config {
                         if let Some(ExportConfig::Simple(types_path)) = conditions.get("types") {
-                            entry_point.insert(
-                                subpath.clone(),
-                                path.join(types_path.trim_start_matches("./")),
-                            );
+                            entry_point.insert(TSEntryPoint {
+                                external_path: subpath.clone(),
+                                internal_path: path.join(types_path.trim_start_matches("./")),
+                            });
                         }
                     }
                 }
@@ -83,7 +109,10 @@ fn get_entry_point(package_json: &PackageJson, path: &Path) -> TSEntryPoint {
         .or(package_json.typings.as_ref())
     {
         // Only use types/typings if there's no exports field
-        entry_point.insert(".".to_string(), path.join(types));
+        entry_point.insert(TSEntryPoint {
+            external_path: ".".to_string(),
+            internal_path: path.join(types),
+        });
     }
 
     entry_point
@@ -92,7 +121,7 @@ fn get_entry_point(package_json: &PackageJson, path: &Path) -> TSEntryPoint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use assertables::assert_matches;
+    use assertables::{assert_contains, assert_matches};
     use daipendency_testing::tempdir::TempDir;
 
     #[test]
@@ -155,9 +184,12 @@ mod tests {
 
         assert_eq!(metadata.name, "test-pkg");
         assert_eq!(metadata.version, Some("1.0.0".to_string()));
-        assert_eq!(
-            metadata.entry_point.get("."),
-            Some(&temp_dir.path.join("dist/index.d.ts"))
+        assert_contains!(
+            metadata.entry_point,
+            &TSEntryPoint {
+                external_path: ".".to_string(),
+                internal_path: temp_dir.path.join("dist/index.d.ts"),
+            }
         );
     }
 
@@ -242,9 +274,12 @@ mod tests {
 
             let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-            assert_eq!(
-                metadata.entry_point.get("."),
-                Some(&temp_dir.path.join("dist/index.d.ts"))
+            assert_contains!(
+                metadata.entry_point,
+                &TSEntryPoint {
+                    external_path: ".".to_string(),
+                    internal_path: temp_dir.path.join("dist/index.d.ts"),
+                }
             );
         }
 
@@ -260,9 +295,12 @@ mod tests {
 
             let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-            assert_eq!(
-                metadata.entry_point.get("."),
-                Some(&temp_dir.path.join("dist/types.d.ts"))
+            assert_contains!(
+                metadata.entry_point,
+                &TSEntryPoint {
+                    external_path: ".".to_string(),
+                    internal_path: temp_dir.path.join("dist/types.d.ts"),
+                }
             );
         }
 
@@ -281,9 +319,12 @@ mod tests {
 
                 let metadata = extract_metadata(&temp_dir.path).unwrap();
 
-                assert_eq!(
-                    metadata.entry_point.get("."),
-                    Some(&temp_dir.path.join("dist/index.d.ts"))
+                assert_contains!(
+                    metadata.entry_point,
+                    &TSEntryPoint {
+                        external_path: ".".to_string(),
+                        internal_path: temp_dir.path.join("dist/index.d.ts"),
+                    }
                 );
             }
 
@@ -333,9 +374,12 @@ mod tests {
                 let metadata = extract_metadata(&temp_dir.path).unwrap();
 
                 assert_eq!(metadata.entry_point.len(), 1);
-                assert_eq!(
-                    metadata.entry_point.get("."),
-                    Some(&temp_dir.path.join("dist/index.d.ts"))
+                assert_contains!(
+                    metadata.entry_point,
+                    &TSEntryPoint {
+                        external_path: ".".to_string(),
+                        internal_path: temp_dir.path.join("dist/index.d.ts"),
+                    }
                 );
             }
 
@@ -364,13 +408,19 @@ mod tests {
                 let metadata = extract_metadata(&temp_dir.path).unwrap();
 
                 assert_eq!(metadata.entry_point.len(), 2);
-                assert_eq!(
-                    metadata.entry_point.get("."),
-                    Some(&temp_dir.path.join("dist/index.d.ts"))
+                assert_contains!(
+                    metadata.entry_point,
+                    &TSEntryPoint {
+                        external_path: ".".to_string(),
+                        internal_path: temp_dir.path.join("dist/index.d.ts"),
+                    }
                 );
-                assert_eq!(
-                    metadata.entry_point.get("./utils"),
-                    Some(&temp_dir.path.join("dist/utils.d.ts"))
+                assert_contains!(
+                    metadata.entry_point,
+                    &TSEntryPoint {
+                        external_path: "./utils".to_string(),
+                        internal_path: temp_dir.path.join("dist/utils.d.ts"),
+                    }
                 );
             }
 
